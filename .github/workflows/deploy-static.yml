@@ -59,6 +59,7 @@ jobs:
       # ─────────────────────────────────────────
       - name: 📦 Install & Build
         run: |
+          corepack enable
           yarn install
           yarn build
           echo "✅ ビルド完了"
