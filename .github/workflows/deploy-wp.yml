@@ -1,0 +1,263 @@
+# ============================================================
+# ③⑤ WordPress テーマ開発用 GitHub Actions デプロイワークフロー
+#     wordpress/themes/{THEME_NAME}/ をXserverのWPテーマへ同期
+#
+# 必要なSecrets:
+#   SSH_HOST        : Xserverホスト名 (例: sv12345.xserver.jp)
+#   SSH_PORT        : 10022
+#   SSH_USER        : Xserverアカウント名 (例: xs123456)
+#   SSH_KEY         : SSH秘密鍵（全文）
+#   REMOTE_BASE_PATH: WordPressのルートパス ※末尾スラッシュなし・絶対パス
+#                     例: /home/xs123456/example.com/public_html
+#   BASIC_AUTH_USER : Basic認証ユーザー名（省略時はスキップ）
+#   BASIC_AUTH_PASS : Basic認証パスワード（省略時はスキップ）
+# ============================================================
+name: 🎨 Deploy WordPress Theme (Xserver)
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    name: rsync → wp-content/themes/<repo>
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      # ─────────────────────────────────────────
+      # 1. ソースコードをチェックアウト
+      # ─────────────────────────────────────────
+      - name: 📦 Checkout
+        uses: actions/checkout@v4
+
+      # ─────────────────────────────────────────
+      # 2. リポジトリ名をテーマ名として使用
+      # ─────────────────────────────────────────
+      - name: 📝 Set theme name from repo
+        id: theme
+        run: |
+          THEME_NAME="${GITHUB_REPOSITORY##*/}"
+          echo "name=${THEME_NAME}" >> $GITHUB_OUTPUT
+          echo "✅ テーマ名: ${THEME_NAME}"
+
+      # ─────────────────────────────────────────
+      # 3. Node.js セットアップ
+      # ─────────────────────────────────────────
+      - name: 🔧 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.x'
+
+      # ─────────────────────────────────────────
+      # 4. node_modules キャッシュ
+      #    2回目以降の yarn install を高速化
+      # ─────────────────────────────────────────
+      - name: 💾 Cache node_modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            node_modules
+            .yarn/cache
+            .pnp.cjs
+            .pnp.loader.mjs
+          key: ${{ runner.os }}-yarn-${{ hashFiles('yarn.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-yarn-
+
+      # ─────────────────────────────────────────
+      # 5. 依存関係インストール
+      # ─────────────────────────────────────────
+      - name: 📦 Install dependencies
+        run: |
+          corepack enable
+          yarn install
+          echo "✅ 依存関係インストール完了"
+
+      # ─────────────────────────────────────────
+      # 6. 品質チェック
+      #    コードの乱れ・ACF設定の不備を事前検出
+      # ─────────────────────────────────────────
+      - name: 🔍 Quality Check
+        continue-on-error: false
+        run: |
+          yarn format:check
+          yarn validate:acf
+          echo "✅ 品質チェック完了"
+
+      # ─────────────────────────────────────────
+      # 7. ビルド
+      #    yarn build:wp → wordpress/themes/{THEME_NAME}/assets/ に出力
+      # ─────────────────────────────────────────
+      - name: 🏗️ Build
+        run: |
+          yarn build:wp
+          echo "✅ ビルド完了"
+          # manifest.dev.json が残っていないか確認（本番混入防止）
+          THEME_NAME="${GITHUB_REPOSITORY##*/}"
+          if [[ -f "wordpress/themes/${THEME_NAME}/assets/manifest.dev.json" ]]; then
+            echo "❌ manifest.dev.json が残っています！削除します"
+            rm "wordpress/themes/${THEME_NAME}/assets/manifest.dev.json"
+          fi
+          if [[ -d "wordpress/themes/${THEME_NAME}/assets/.vite" ]]; then
+            rm -rf "wordpress/themes/${THEME_NAME}/assets/.vite"
+          fi
+
+      # ─────────────────────────────────────────
+      # 8. REMOTE_BASE_PATH の末尾スラッシュを除去
+      # ─────────────────────────────────────────
+      - name: 🔧 Normalize REMOTE_BASE_PATH
+        run: |
+          REMOTE_PATH="${{ secrets.REMOTE_BASE_PATH }}"
+          REMOTE_PATH="${REMOTE_PATH%/}"
+          echo "REMOTE_PATH=${REMOTE_PATH}" >> $GITHUB_ENV
+          echo "✅ デプロイ先: ${REMOTE_PATH}"
+
+      # ─────────────────────────────────────────
+      # 9. Basic Auth ハッシュ生成
+      # ─────────────────────────────────────────
+      - name: 🔐 Generate Basic Auth hash
+        env:
+          BASIC_AUTH_USER: ${{ secrets.BASIC_AUTH_USER }}
+          BASIC_AUTH_PASS: ${{ secrets.BASIC_AUTH_PASS }}
+        run: |
+          if [[ -z "$BASIC_AUTH_USER" || -z "$BASIC_AUTH_PASS" ]]; then
+            echo "⏭  Basic Auth設定なし・スキップ"
+            exit 0
+          fi
+          HASH=$(openssl passwd -apr1 "$BASIC_AUTH_PASS")
+          echo "${BASIC_AUTH_USER}:${HASH}" > /tmp/.htpasswd
+          echo "✅ Basic Auth ハッシュ生成完了"
+
+      # ─────────────────────────────────────────
+      # 10. ssh-agent に秘密鍵を登録
+      # ─────────────────────────────────────────
+      - name: 🔑 Setup SSH Agent
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_KEY }}
+
+      # ─────────────────────────────────────────
+      # 11. Xserverの known_hosts 登録
+      # ─────────────────────────────────────────
+      - name: 🌐 Add Xserver to known_hosts
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -p ${{ secrets.SSH_PORT }} -H ${{ secrets.SSH_HOST }} >> ~/.ssh/known_hosts
+          echo "✅ known_hosts 更新完了"
+
+      # ─────────────────────────────────────────
+      # 12. SSL強制リダイレクト + Basic Auth
+      #     サーバー上のWPルートの .htaccess に設定
+      #     .htpasswd は public_html の1つ上に配置
+      #     ※ブラウザから絶対にアクセスできない場所
+      # ─────────────────────────────────────────
+      - name: 🔒 Setup .htaccess on server
+        env:
+          BASIC_AUTH_USER: ${{ secrets.BASIC_AUTH_USER }}
+        run: |
+          PARENT_PATH=$(dirname "${REMOTE_PATH}")
+          HTPASSWD_PATH="${PARENT_PATH}/.htpasswd"
+
+          ssh -p ${{ secrets.SSH_PORT }} \
+            ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
+            "bash -s" << SSHEOF
+          HTACCESS="${REMOTE_PATH}/.htaccess"
+
+          if [[ ! -f "\${HTACCESS}" ]]; then touch "\${HTACCESS}"; fi
+
+          # SSL強制リダイレクト（重複チェック）
+          if ! grep -q "HTTPS.*off" "\${HTACCESS}"; then
+            printf '\n# === SSL強制リダイレクト ===\nRewriteEngine On\nRewriteCond %%{HTTPS} off\nRewriteRule ^(.*)\$ https://%%{HTTP_HOST}%%{REQUEST_URI} [R=301,L]\n' >> "\${HTACCESS}"
+            echo "✅ SSL強制リダイレクト追加"
+          else
+            echo "✅ SSL強制リダイレクトは既に存在します"
+          fi
+
+          # Basic Auth（重複チェック）
+          if [[ -n "${BASIC_AUTH_USER}" ]] && ! grep -q "AuthType Basic" "\${HTACCESS}"; then
+            printf '\n# === Basic Auth ===\nAuthType Basic\nAuthName "Restricted Area"\nAuthUserFile %s\nRequire valid-user\n' "${HTPASSWD_PATH}" >> "\${HTACCESS}"
+            echo "✅ Basic Auth設定追加"
+          else
+            echo "✅ Basic Auth設定は既に存在するかスキップ"
+          fi
+          SSHEOF
+
+      # ─────────────────────────────────────────
+      # 13. .htpasswd をドキュメントルート1つ上に配置
+      #     Basic Auth設定がある場合のみ実行
+      # ─────────────────────────────────────────
+      - name: 🔐 Place .htpasswd on server
+        env:
+          BASIC_AUTH_USER: ${{ secrets.BASIC_AUTH_USER }}
+        run: |
+          if [[ -z "$BASIC_AUTH_USER" ]]; then
+            echo "⏭  Basic Auth設定なし・スキップ"
+            exit 0
+          fi
+          PARENT_PATH=$(dirname "${REMOTE_PATH}")
+          HTPASSWD_PATH="${PARENT_PATH}/.htpasswd"
+          scp -P ${{ secrets.SSH_PORT }} \
+            /tmp/.htpasswd \
+            "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:${HTPASSWD_PATH}"
+          echo "✅ .htpasswd 配置完了: ${HTPASSWD_PATH}"
+
+      # ─────────────────────────────────────────
+      # 14. テーマディレクトリをリモートで事前作成
+      # ─────────────────────────────────────────
+      - name: 📁 Create theme directory on server
+        run: |
+          THEME_NAME="${{ steps.theme.outputs.name }}"
+          THEME_PATH="${REMOTE_PATH}/wp-content/themes/${THEME_NAME}"
+          ssh -p ${{ secrets.SSH_PORT }} \
+            ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
+            "mkdir -p ${THEME_PATH}"
+          echo "✅ ディレクトリ作成: ${THEME_PATH}"
+
+      # ─────────────────────────────────────────
+      # 15. rsync でテーマを同期
+      #     wordpress/themes/{THEME_NAME}/ → WPサーバーのテーマフォルダ
+      # ─────────────────────────────────────────
+      - name: 🚀 Deploy theme via rsync
+        run: |
+          THEME_NAME="${{ steps.theme.outputs.name }}"
+          THEME_PATH="${REMOTE_PATH}/wp-content/themes/${THEME_NAME}"
+          rsync -avz --delete \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='node_modules' \
+            --exclude='.DS_Store' \
+            --exclude='manifest.dev.json' \
+            --exclude='.vite' \
+            -e "ssh -p ${{ secrets.SSH_PORT }}" \
+            "wordpress/themes/${THEME_NAME}/" \
+            "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:${THEME_PATH}/"
+          echo "✅ テーマ同期完了: ${THEME_PATH}"
+
+      # ─────────────────────────────────────────
+      # 16. WordPress キャッシュクリア (WP-CLI)
+      # ─────────────────────────────────────────
+      - name: 🔄 Clear WordPress cache
+        continue-on-error: true
+        run: |
+          ssh -p ${{ secrets.SSH_PORT }} \
+            ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
+            "cd ${REMOTE_PATH} && wp cache flush --allow-root 2>/dev/null || true"
+          echo "✅ キャッシュクリア試行"
+
+      # ─────────────────────────────────────────
+      # 17. デプロイサマリー
+      # ─────────────────────────────────────────
+      - name: 📊 Deploy Summary
+        if: always()
+        run: |
+          echo "## 🎨 WordPressテーマ デプロイ結果" >> $GITHUB_STEP_SUMMARY
+          echo "| 項目 | 値 |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-----|" >> $GITHUB_STEP_SUMMARY
+          echo "| テーマ名 | \`${{ steps.theme.outputs.name }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| デプロイ先 | \`wp-content/themes/${{ steps.theme.outputs.name }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| ブランチ | \`${{ github.ref_name }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| コミット | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| ステータス | \`${{ job.status }}\` |" >> $GITHUB_STEP_SUMMARY

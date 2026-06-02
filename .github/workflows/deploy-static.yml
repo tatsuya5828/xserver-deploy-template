@@ -1,0 +1,194 @@
+# ============================================================
+# ③④ 静的サイト用 GitHub Actions デプロイワークフロー
+#     rsync over SSH + openssl で .htpasswd 自動生成
+#
+# 必要なSecrets:
+#   SSH_HOST        : Xserverホスト名 (例: sv12345.xserver.jp)
+#   SSH_PORT        : 10022
+#   SSH_USER        : Xserverアカウント名 (例: xs123456)
+#   SSH_KEY         : SSH秘密鍵（全文）
+#   REMOTE_BASE_PATH: デプロイ先の絶対パス ※末尾スラッシュなし
+#                     例: /home/xs123456/example.com/public_html
+#   BASIC_AUTH_USER : Basic認証ユーザー名（省略時はスキップ）
+#   BASIC_AUTH_PASS : Basic認証パスワード（省略時はスキップ）
+# ============================================================
+name: 🚀 Deploy Static Site (Xserver)
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    name: rsync → Xserver
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      # ─────────────────────────────────────────
+      # 1. ソースコードをチェックアウト
+      # ─────────────────────────────────────────
+      - name: 📦 Checkout
+        uses: actions/checkout@v4
+
+      # ─────────────────────────────────────────
+      # 2. Node.js セットアップ
+      # ─────────────────────────────────────────
+      - name: 🔧 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.x'
+
+      # ─────────────────────────────────────────
+      # 3. node_modules キャッシュ
+      #    2回目以降の yarn install を高速化
+      # ─────────────────────────────────────────
+      - name: 💾 Cache node_modules
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-yarn-${{ hashFiles('yarn.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-yarn-
+
+      # ─────────────────────────────────────────
+      # 4. 依存関係インストール＆ビルド
+      #    yarn のみ使用 / dist/ をデプロイ対象に設定
+      # ─────────────────────────────────────────
+      - name: 📦 Install & Build
+        run: |
+          yarn install
+          yarn build
+          echo "✅ ビルド完了"
+          echo "DEPLOY_DIR=dist" >> $GITHUB_ENV
+          echo "✅ デプロイ対象: dist/"
+
+      # ─────────────────────────────────────────
+      # 5. REMOTE_BASE_PATH の末尾スラッシュを除去
+      # ─────────────────────────────────────────
+      - name: 🔧 Normalize REMOTE_BASE_PATH
+        run: |
+          REMOTE_PATH="${{ secrets.REMOTE_BASE_PATH }}"
+          REMOTE_PATH="${REMOTE_PATH%/}"
+          echo "REMOTE_PATH=${REMOTE_PATH}" >> $GITHUB_ENV
+          echo "✅ デプロイ先: ${REMOTE_PATH}"
+
+      # ─────────────────────────────────────────
+      # 6. .htpasswd 生成 (Basic Auth)
+      #    .htpasswd はドキュメントルート1つ上に配置
+      #    例: /home/xs123456/example.com/.htpasswd
+      #    ※ブラウザから絶対にアクセスできない場所に置くため
+      # ─────────────────────────────────────────
+      - name: 🔐 Generate .htpasswd (Basic Auth)
+        env:
+          BASIC_AUTH_USER: ${{ secrets.BASIC_AUTH_USER }}
+          BASIC_AUTH_PASS: ${{ secrets.BASIC_AUTH_PASS }}
+        run: |
+          if [[ -z "$BASIC_AUTH_USER" || -z "$BASIC_AUTH_PASS" ]]; then
+            echo "⏭  Basic Auth設定なし・スキップ"
+            # スキップ時も HTPASSWD_PATH を設定
+            echo "HTPASSWD_PATH=${REMOTE_PATH}/.htpasswd" >> $GITHUB_ENV
+            exit 0
+          fi
+          HASH=$(openssl passwd -apr1 "$BASIC_AUTH_PASS")
+          # .htpasswd は public_html の1つ上に配置
+          PARENT_PATH=$(dirname "${REMOTE_PATH}")
+          HTPASSWD_PATH="${PARENT_PATH}/.htpasswd"
+          echo "HTPASSWD_PATH=${HTPASSWD_PATH}" >> $GITHUB_ENV
+
+          # dist/.htpasswd は置かない（公開ディレクトリ外で管理するため）
+          # .htaccess に AuthUserFile として絶対パスで参照させる
+          if [[ ! -f "${DEPLOY_DIR}/.htaccess" ]]; then
+            touch "${DEPLOY_DIR}/.htaccess"
+          fi
+          if ! grep -q "AuthType Basic" "${DEPLOY_DIR}/.htaccess"; then
+            printf '\n# === Basic Auth ===\nAuthType Basic\nAuthName "Restricted Area"\nAuthUserFile %s\nRequire valid-user\n' "${HTPASSWD_PATH}" >> "${DEPLOY_DIR}/.htaccess"
+            echo "✅ .htaccess にBasic Auth設定を追加"
+          else
+            echo "✅ Basic Auth設定は既に存在します"
+          fi
+          # .htpasswd の中身をファイルに書き出す（rsync後にSSHで配置）
+          echo "${BASIC_AUTH_USER}:${HASH}" > /tmp/.htpasswd
+          echo "✅ .htpasswd 生成完了 (配置先: ${HTPASSWD_PATH})"
+
+      # ─────────────────────────────────────────
+      # 7. SSL強制リダイレクト (.htaccess に追加)
+      # ─────────────────────────────────────────
+      - name: 🔒 Add SSL redirect to .htaccess
+        run: |
+          if [[ ! -f "${DEPLOY_DIR}/.htaccess" ]]; then
+            touch "${DEPLOY_DIR}/.htaccess"
+          fi
+          if ! grep -q "HTTPS.*off" "${DEPLOY_DIR}/.htaccess"; then
+            printf '\n# === SSL強制リダイレクト ===\nRewriteEngine On\nRewriteCond %%{HTTPS} off\nRewriteRule ^(.*)$ https://%%{HTTP_HOST}%%{REQUEST_URI} [R=301,L]\n' >> "${DEPLOY_DIR}/.htaccess"
+            echo "✅ SSL強制リダイレクト設定を追加"
+          else
+            echo "✅ SSL強制リダイレクト設定は既に存在します"
+          fi
+
+      # ─────────────────────────────────────────
+      # 8. ssh-agent に秘密鍵を登録
+      # ─────────────────────────────────────────
+      - name: 🔑 Setup SSH Agent
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_KEY }}
+
+      # ─────────────────────────────────────────
+      # 9. Xserverの known_hosts 登録
+      # ─────────────────────────────────────────
+      - name: 🌐 Add Xserver to known_hosts
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -p ${{ secrets.SSH_PORT }} -H ${{ secrets.SSH_HOST }} >> ~/.ssh/known_hosts
+          echo "✅ known_hosts 更新完了"
+
+      # ─────────────────────────────────────────
+      # 10. rsync でデプロイ
+      #     dist/ の中身のみ転送
+      # ─────────────────────────────────────────
+      - name: 🚀 Deploy via rsync
+        run: |
+          rsync -avz --delete \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='node_modules' \
+            --exclude='.DS_Store' \
+            --exclude='src' \
+            -e "ssh -p ${{ secrets.SSH_PORT }}" \
+            "${DEPLOY_DIR}/" \
+            "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:${REMOTE_PATH}/"
+          echo "✅ デプロイ完了: ${REMOTE_PATH}"
+
+      # ─────────────────────────────────────────
+      # 11. .htpasswd をドキュメントルート1つ上に配置
+      #     Basic Auth設定がある場合のみ実行
+      # ─────────────────────────────────────────
+      - name: 🔐 Place .htpasswd on server
+        env:
+          BASIC_AUTH_USER: ${{ secrets.BASIC_AUTH_USER }}
+        run: |
+          if [[ -z "$BASIC_AUTH_USER" ]]; then
+            echo "⏭  Basic Auth設定なし・スキップ"
+            exit 0
+          fi
+          scp -P ${{ secrets.SSH_PORT }} \
+            /tmp/.htpasswd \
+            "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:${HTPASSWD_PATH}"
+          echo "✅ .htpasswd 配置完了: ${HTPASSWD_PATH}"
+
+      # ─────────────────────────────────────────
+      # 12. デプロイ結果をサマリーに表示
+      # ─────────────────────────────────────────
+      - name: 📊 Deploy Summary
+        if: always()
+        run: |
+          echo "## 🚀 デプロイ結果" >> $GITHUB_STEP_SUMMARY
+          echo "| 項目 | 値 |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-----|" >> $GITHUB_STEP_SUMMARY
+          echo "| ブランチ | \`${{ github.ref_name }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| コミット | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| 実行者 | ${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| ステータス | ${{ job.status }} |" >> $GITHUB_STEP_SUMMARY
