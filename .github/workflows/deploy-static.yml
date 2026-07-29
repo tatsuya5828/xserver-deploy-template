@@ -20,6 +20,10 @@ on:
       - main
   workflow_dispatch:
 
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   deploy:
     name: rsync → Xserver
@@ -60,14 +64,31 @@ jobs:
       - name: 📦 Install & Build
         run: |
           corepack enable
-          yarn install
+          yarn install --immutable
           yarn build
           echo "✅ ビルド完了"
           echo "DEPLOY_DIR=dist" >> $GITHUB_ENV
           echo "✅ デプロイ対象: dist/"
 
       # ─────────────────────────────────────────
-      # 5. REMOTE_BASE_PATH の末尾スラッシュを除去
+      # 5. ビルド成果物の検証
+      #    dist/ が空・不完全な場合はデプロイを中止
+      #    （rsync --delete による本番破壊を防ぐ）
+      # ─────────────────────────────────────────
+      - name: 🛡️ Verify build output
+        run: |
+          if [[ ! -d "${DEPLOY_DIR}" ]] || [[ -z "$(ls -A "${DEPLOY_DIR}" 2>/dev/null)" ]]; then
+            echo "::error::${DEPLOY_DIR}/ が空です。ビルドが正しく完了していない可能性があるため、デプロイを中止します。"
+            exit 1
+          fi
+          if [[ ! -f "${DEPLOY_DIR}/index.html" ]]; then
+            echo "::error::${DEPLOY_DIR}/index.html が見つかりません。デプロイを中止します。"
+            exit 1
+          fi
+          echo "✅ ビルド成果物を確認しました"
+
+      # ─────────────────────────────────────────
+      # 6. REMOTE_BASE_PATH の末尾スラッシュを除去
       # ─────────────────────────────────────────
       - name: 🔧 Normalize REMOTE_BASE_PATH
         run: |
@@ -77,7 +98,7 @@ jobs:
           echo "✅ デプロイ先: ${REMOTE_PATH}"
 
       # ─────────────────────────────────────────
-      # 6. .htpasswd 生成 (Basic Auth)
+      # 7. .htpasswd 生成 (Basic Auth)
       #    .htpasswd はドキュメントルート1つ上に配置
       #    例: /home/xs123456/example.com/.htpasswd
       #    ※ブラウザから絶対にアクセスできない場所に置くため
@@ -115,7 +136,7 @@ jobs:
           echo "✅ .htpasswd 生成完了 (配置先: ${HTPASSWD_PATH})"
 
       # ─────────────────────────────────────────
-      # 7. SSL強制リダイレクト (.htaccess に追加)
+      # 8. SSL強制リダイレクト (.htaccess に追加)
       # ─────────────────────────────────────────
       - name: 🔒 Add SSL redirect to .htaccess
         run: |
@@ -130,7 +151,7 @@ jobs:
           fi
 
       # ─────────────────────────────────────────
-      # 8. ssh-agent に秘密鍵を登録
+      # 9. ssh-agent に秘密鍵を登録
       # ─────────────────────────────────────────
       - name: 🔑 Setup SSH Agent
         uses: webfactory/ssh-agent@v0.9.0
@@ -138,7 +159,7 @@ jobs:
           ssh-private-key: ${{ secrets.SSH_KEY }}
 
       # ─────────────────────────────────────────
-      # 9. Xserverの known_hosts 登録
+      # 10. Xserverの known_hosts 登録
       # ─────────────────────────────────────────
       - name: 🌐 Add Xserver to known_hosts
         run: |
@@ -147,7 +168,7 @@ jobs:
           echo "✅ known_hosts 更新完了"
 
       # ─────────────────────────────────────────
-      # 10. rsync でデプロイ
+      # 11. rsync でデプロイ
       #     dist/ の中身のみ転送
       # ─────────────────────────────────────────
       - name: 🚀 Deploy via rsync
@@ -164,7 +185,7 @@ jobs:
           echo "✅ デプロイ完了: ${REMOTE_PATH}"
 
       # ─────────────────────────────────────────
-      # 11. .htpasswd をドキュメントルート1つ上に配置
+      # 12. .htpasswd をドキュメントルート1つ上に配置
       #     Basic Auth設定がある場合のみ実行
       # ─────────────────────────────────────────
       - name: 🔐 Place .htpasswd on server
@@ -181,7 +202,7 @@ jobs:
           echo "✅ .htpasswd 配置完了: ${HTPASSWD_PATH}"
 
       # ─────────────────────────────────────────
-      # 12. デプロイ結果をサマリーに表示
+      # 13. デプロイ結果をサマリーに表示
       # ─────────────────────────────────────────
       - name: 📊 Deploy Summary
         if: always()
