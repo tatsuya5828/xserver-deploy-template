@@ -1,16 +1,21 @@
 # ============================================================
-# ③④ 静的サイト用 GitHub Actions デプロイワークフロー
-#     rsync over SSH + openssl で .htpasswd 自動生成
+# 静的サイト用 GitHub Actions デプロイワークフロー
+#   rsync over SSH + .htpasswd 自動生成
 #
-# 必要なSecrets:
-#   SSH_HOST        : Xserverホスト名 (例: sv12345.xserver.jp)
-#   SSH_PORT        : 10022
-#   SSH_USER        : Xserverアカウント名 (例: xs123456)
-#   SSH_KEY         : SSH秘密鍵（全文）
-#   REMOTE_BASE_PATH: デプロイ先の絶対パス ※末尾スラッシュなし
-#                     例: /home/xs123456/example.com/public_html
-#   BASIC_AUTH_USER : Basic認証ユーザー名（省略時はスキップ）
-#   BASIC_AUTH_PASS : Basic認証パスワード（省略時はスキップ）
+# 必須Secrets:
+#   SSH_HOST         : Xserverホスト名 (例: sv12345.xserver.jp)
+#   SSH_PORT         : 10022
+#   SSH_USER         : Xserverアカウント名 (例: xs123456)
+#   SSH_KEY          : SSH秘密鍵（全文）
+#   REMOTE_BASE_PATH : デプロイ先の絶対パス ※末尾スラッシュ不要
+#                      例: /home/xs123456/example.com/public_html
+#
+# 任意Secrets:
+#   SSH_KNOWN_HOSTS  : サーバのホスト鍵。未設定時は ssh-keyscan にフォールバックするが、
+#                      中間者攻撃を検知できないため設定を強く推奨。
+#                      初回実行時にログへ登録用の値が出力される。
+#   BASIC_AUTH_USER  : Basic認証ユーザー名（未設定なら認証なし）
+#   BASIC_AUTH_PASS  : Basic認証パスワード（未設定なら認証なし）
 # ============================================================
 name: 🚀 Deploy Static Site (Xserver)
 
@@ -19,65 +24,246 @@ on:
     branches:
       - main
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: '転送内容をプレビューするだけで、サーバには反映しない'
+        type: boolean
+        default: false
+      force:
+        description: '削除ファイル数のガード (DELETE_THRESHOLD) を無視して強行する'
+        type: boolean
+        default: false
+
+# 最小権限。デプロイはSSH経由なのでリポジトリの読み取りだけあればよい
+permissions:
+  contents: read
 
 concurrency:
   group: deploy-${{ github.ref }}
   cancel-in-progress: false
 
+# bash を明示すると GitHub が `set -eo pipefail` を付与する
+defaults:
+  run:
+    shell: bash
+
+env:
+  DEPLOY_DIR: dist
+  # 削除予定ファイルがこの件数を超えたらデプロイを中止する（force で上書き可）。
+  # 0 = ガード無効。テストサーバー運用のため既定では無効にしている。
+  # 本番サーバーへ流用する場合は 50 程度を設定すること。
+  DELETE_THRESHOLD: 0
+
 jobs:
   deploy:
     name: rsync → Xserver
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
+
+    # Secrets は run: の中に ${{ }} で展開せず、必ず env 経由で参照する。
+    # ${{ }} はシェル実行前のテキスト置換のため、値に空白やクォートが混ざると
+    # コマンドが壊れる（＝インジェクションになり得る）。
+    # 機微度の高い BASIC_AUTH_PASS / SSH_KEY は必要なステップにだけ渡す。
+    env:
+      SSH_HOST: ${{ secrets.SSH_HOST }}
+      SSH_PORT: ${{ secrets.SSH_PORT }}
+      SSH_USER: ${{ secrets.SSH_USER }}
+      REMOTE_BASE_PATH: ${{ secrets.REMOTE_BASE_PATH }}
+      SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+      BASIC_AUTH_USER: ${{ secrets.BASIC_AUTH_USER }}
 
     steps:
-      # ─────────────────────────────────────────
-      # 1. ソースコードをチェックアウト
-      # ─────────────────────────────────────────
+      - name: 🔍 Validate required secrets
+        env:
+          SSH_KEY: ${{ secrets.SSH_KEY }}
+        run: |
+          missing=()
+          for name in SSH_HOST SSH_PORT SSH_USER SSH_KEY REMOTE_BASE_PATH; do
+            if [[ -z "${!name}" ]]; then
+              missing+=("$name")
+            fi
+          done
+          if (( ${#missing[@]} > 0 )); then
+            echo "::error::必須のSecretsが未設定です: ${missing[*]}"
+            echo "リポジトリの Settings → Secrets and variables → Actions で設定してください。"
+            exit 1
+          fi
+          if [[ ! "$SSH_PORT" =~ ^[0-9]+$ ]]; then
+            echo "::error::SSH_PORT が数値ではありません。"
+            exit 1
+          fi
+          echo "✅ 必須Secretsを確認しました"
+
+      # rsync --delete は指定先を丸ごと同期するため、パスの誤りは本番破壊に直結する。
+      # REMOTE_BASE_PATH が空だと転送先が `user@host:/` になり、ホーム配下が消える。
+      - name: 🛡️ Validate REMOTE_BASE_PATH
+        run: |
+          path="${REMOTE_BASE_PATH%/}"
+
+          if [[ -z "$path" ]]; then
+            echo "::error::REMOTE_BASE_PATH が空です。"
+            exit 1
+          fi
+          if [[ "$path" != /* ]]; then
+            echo "::error::REMOTE_BASE_PATH は / で始まる絶対パスを指定してください。"
+            exit 1
+          fi
+          # SSH越しにシングルクォートで括って渡すため、扱える文字を制限する
+          if [[ ! "$path" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+            echo "::error::REMOTE_BASE_PATH に使用できない文字が含まれています（許可: 英数字 . _ - /）。"
+            exit 1
+          fi
+          if [[ "$path" == *".."* ]]; then
+            echo "::error::REMOTE_BASE_PATH に .. を含めることはできません。"
+            exit 1
+          fi
+          case "$path" in
+            /|/home|/root|/etc|/var|/usr|/bin|/sbin|/opt|/tmp|/srv)
+              echo "::error::REMOTE_BASE_PATH がシステムディレクトリを指しています: ${path}"
+              exit 1
+              ;;
+          esac
+          depth=$(awk -F/ '{print NF-1}' <<< "$path")
+          if (( depth < 3 )); then
+            echo "::error::REMOTE_BASE_PATH の階層が浅すぎます（深さ ${depth}）。"
+            echo "::error::/home/<アカウント>/<ドメイン>/public_html のような 3 階層以上を指定してください。"
+            exit 1
+          fi
+
+          # パスを遡って公開ルート（public_html 等）を特定する。
+          # ここで得た public_root は次の 2 つに使う。
+          #   1. デプロイ先が公開領域の内側にあるかの検証
+          #   2. .htpasswd の退避先（PRIVATE_DIR）の決定
+          public_root=""
+          probe="$path"
+          while [[ "$probe" == */* && "$probe" != "/" ]]; do
+            case "$(basename "$probe")" in
+              public_html|htdocs|www|public|web|html)
+                public_root="$probe"
+                ;;
+            esac
+            probe="$(dirname "$probe")"
+          done
+
+          # 深さチェックは / や /home を弾くための粗いガード。
+          # 「1階層上を指してしまった」ミスはここでは検知できないため、
+          # 公開ルートを特定できたかどうかで判断する。
+          #
+          # basename だけを見ると public_html/<サブディレクトリ> という
+          # 正当な構成まで警告してしまうため、公開ルート配下にあれば正常とみなす。
+          if [[ -z "$public_root" ]]; then
+            echo "::warning::デプロイ先が公開ディレクトリ配下にありません: ${path}"
+            echo "::warning::REMOTE_BASE_PATH が正しいか確認してください（想定: .../public_html[/サブディレクトリ]）。"
+          fi
+
+          # .htpasswd の置き場所（PRIVATE_DIR）を決める。
+          #
+          # 単に dirname を取ると、サブディレクトリへデプロイする構成では
+          # それ自体が公開領域（public_html 配下）になり、
+          # bcrypt ハッシュがブラウザから到達し得る。
+          # そこで公開ディレクトリより外側の階層を退避先にする。
+          if [[ -n "$public_root" ]]; then
+            # 公開ルートの 1 つ上（例: /home/acct/example.xsrv.jp）
+            private_dir="$(dirname "$public_root")"
+          else
+            # 公開ディレクトリ名が見つからない構成では従来どおり 1 つ上を使う
+            private_dir="$(dirname "$path")"
+          fi
+
+          # 退避先が公開領域に含まれていないことを最終確認する
+          if [[ -n "$public_root" && "$private_dir" == "$public_root"* ]]; then
+            echo "::error::退避先 ${private_dir} が公開領域 ${public_root} の内側です。"
+            exit 1
+          fi
+
+          # 旧仕様（dirname 1回）の退避先。公開領域内に .htpasswd を
+          # 置いてしまっていた時期の名残を掃除するために保持する。
+          legacy_dir="$(dirname "$path")"
+
+          # サマリー表示用の相対パス。
+          # REMOTE_PATH は Secret 由来のため全体が *** にマスクされて読めない。
+          # 公開ルート以降だけを取り出せばマスクを含まず、どこへ出たかが分かる。
+          if [[ -n "$public_root" ]]; then
+            display_path="$(basename "$public_root")${path#$public_root}"
+          else
+            display_path="$(basename "$path")"
+          fi
+
+          # .htpasswd のファイル名に付ける案件識別子。
+          #
+          # 退避先（PRIVATE_DIR）はドメイン単位で共通のため、同一ドメイン配下で
+          # 複数案件を運用すると .htpasswd を互いに上書きし、
+          # 先にデプロイした案件の Basic 認証が壊れる。
+          # そこで公開ルートからの相対パスを平坦化して名前に含め、案件ごとに分ける。
+          #   public_html/client-a       -> .htpasswd-client-a
+          #   public_html/foo/bar        -> .htpasswd-foo-bar
+          #   public_html（直下）        -> .htpasswd
+          if [[ -n "$public_root" && "$path" != "$public_root" ]]; then
+            slug="${path#$public_root/}"
+            slug="${slug//\//-}"
+            htpasswd_name=".htpasswd-${slug}"
+          else
+            htpasswd_name=".htpasswd"
+          fi
+
+          echo "REMOTE_PATH=${path}" >> "$GITHUB_ENV"
+          echo "PRIVATE_DIR=${private_dir}" >> "$GITHUB_ENV"
+          echo "LEGACY_DIR=${legacy_dir}" >> "$GITHUB_ENV"
+          echo "DISPLAY_PATH=${display_path}" >> "$GITHUB_ENV"
+          echo "HTPASSWD_NAME=${htpasswd_name}" >> "$GITHUB_ENV"
+          echo "✅ デプロイ先: ${path}"
+          echo "✅ 退避先（非公開）: ${private_dir}"
+
       - name: 📦 Checkout
         uses: actions/checkout@v4
 
-      # ─────────────────────────────────────────
-      # 2. Node.js セットアップ
-      # ─────────────────────────────────────────
       - name: 🔧 Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '22.x'
+          node-version-file: .node-version
 
-      # ─────────────────────────────────────────
-      # 3. node_modules キャッシュ
-      #    2回目以降の yarn install を高速化
-      # ─────────────────────────────────────────
-      - name: 💾 Cache node_modules
+      - name: 🧰 Enable Corepack
+        run: corepack enable
+
+      # .yarnrc.yml はコミットしない運用のため、キャッシュ場所を決め打ちにせず
+      # yarn 自身に問い合わせる（enableGlobalCache の設定に関係なく正しい場所を得る）
+      - name: 📍 Resolve Yarn cache folder
+        id: yarn-cache
+        run: echo "dir=$(yarn config get cacheFolder)" >> "$GITHUB_OUTPUT"
+
+      # Yarn 4 は PnP 構成のため node_modules は生成されない。
+      # キャッシュ対象は yarn のキャッシュ + unplugged（sharp など）。
+      - name: 💾 Cache Yarn
         uses: actions/cache@v4
         with:
-          path: node_modules
-          key: ${{ runner.os }}-yarn-${{ hashFiles('yarn.lock') }}
+          path: |
+            ${{ steps.yarn-cache.outputs.dir }}
+            .yarn/unplugged
+            .yarn/install-state.gz
+          key: ${{ runner.os }}-yarn4-${{ hashFiles('yarn.lock', 'package.json') }}
           restore-keys: |
-            ${{ runner.os }}-yarn-
+            ${{ runner.os }}-yarn4-
 
-      # ─────────────────────────────────────────
-      # 4. 依存関係インストール＆ビルド
-      #    yarn のみ使用 / dist/ をデプロイ対象に設定
-      # ─────────────────────────────────────────
-      - name: 📦 Install & Build
+      - name: 📦 Install dependencies
+        run: yarn install --immutable
+
+      # `yarn build` は format（eslint --fix / prettier --write）を含むため CI では使わない。
+      # build:ci はチェックのみで、lint 違反があればここで落ちる。
+      - name: 🏗️ Build
+        run: yarn build:ci
+
+      - name: 🔍 Ensure build did not modify sources
         run: |
-          corepack enable
-          yarn install --immutable
-          yarn build
-          echo "✅ ビルド完了"
-          echo "DEPLOY_DIR=dist" >> $GITHUB_ENV
-          echo "✅ デプロイ対象: dist/"
+          if ! git diff --quiet; then
+            echo "::error::ビルド中に追跡ファイルが変更されました。ローカルで 'yarn format' を実行してコミットしてください。"
+            git --no-pager diff --stat
+            exit 1
+          fi
+          echo "✅ ソースは変更されていません"
 
-      # ─────────────────────────────────────────
-      # 5. ビルド成果物の検証
-      #    dist/ が空・不完全な場合はデプロイを中止
-      #    （rsync --delete による本番破壊を防ぐ）
-      # ─────────────────────────────────────────
       - name: 🛡️ Verify build output
         run: |
-          if [[ ! -d "${DEPLOY_DIR}" ]] || [[ -z "$(ls -A "${DEPLOY_DIR}" 2>/dev/null)" ]]; then
+          if [[ ! -d "$DEPLOY_DIR" ]] || [[ -z "$(ls -A "$DEPLOY_DIR" 2>/dev/null)" ]]; then
             echo "::error::${DEPLOY_DIR}/ が空です。ビルドが正しく完了していない可能性があるため、デプロイを中止します。"
             exit 1
           fi
@@ -87,130 +273,274 @@ jobs:
           fi
           echo "✅ ビルド成果物を確認しました"
 
-      # ─────────────────────────────────────────
-      # 6. REMOTE_BASE_PATH の末尾スラッシュを除去
-      # ─────────────────────────────────────────
-      - name: 🔧 Normalize REMOTE_BASE_PATH
-        run: |
-          REMOTE_PATH="${{ secrets.REMOTE_BASE_PATH }}"
-          REMOTE_PATH="${REMOTE_PATH%/}"
-          echo "REMOTE_PATH=${REMOTE_PATH}" >> $GITHUB_ENV
-          echo "✅ デプロイ先: ${REMOTE_PATH}"
-
-      # ─────────────────────────────────────────
-      # 7. .htpasswd 生成 (Basic Auth)
-      #    .htpasswd はドキュメントルート1つ上に配置
-      #    例: /home/xs123456/example.com/.htpasswd
-      #    ※ブラウザから絶対にアクセスできない場所に置くため
-      # ─────────────────────────────────────────
-      - name: 🔐 Generate .htpasswd (Basic Auth)
+      # .htaccess はマーカーで囲んだブロックだけを生成・差し替えする。
+      # 利用者が src/public/.htaccess に書いた内容には触れない。
+      #
+      # 順序が重要: SSL リダイレクトを Basic 認証より前に置く。
+      # 逆順だと http アクセス時に HTTPS へ飛ぶ前に認証ダイアログが出て、
+      # パスワードが平文で送信され得る。
+      - name: 📝 Generate .htaccess (SSL redirect / Basic Auth)
         env:
-          BASIC_AUTH_USER: ${{ secrets.BASIC_AUTH_USER }}
           BASIC_AUTH_PASS: ${{ secrets.BASIC_AUTH_PASS }}
         run: |
-          if [[ -z "$BASIC_AUTH_USER" || -z "$BASIC_AUTH_PASS" ]]; then
-            echo "⏭  Basic Auth設定なし・スキップ"
-            # スキップ時も HTPASSWD_PATH を設定
-            echo "HTPASSWD_PATH=${REMOTE_PATH}/.htpasswd" >> $GITHUB_ENV
-            exit 0
-          fi
-          HASH=$(openssl passwd -apr1 "$BASIC_AUTH_PASS")
-          # .htpasswd は public_html の1つ上に配置
-          PARENT_PATH=$(dirname "${REMOTE_PATH}")
-          HTPASSWD_PATH="${PARENT_PATH}/.htpasswd"
-          echo "HTPASSWD_PATH=${HTPASSWD_PATH}" >> $GITHUB_ENV
+          HTACCESS="${DEPLOY_DIR}/.htaccess"
+          BEGIN='# >>> deploy-kit managed >>>'
+          END='# <<< deploy-kit managed <<<'
 
-          # dist/.htpasswd は置かない（公開ディレクトリ外で管理するため）
-          # .htaccess に AuthUserFile として絶対パスで参照させる
-          if [[ ! -f "${DEPLOY_DIR}/.htaccess" ]]; then
-            touch "${DEPLOY_DIR}/.htaccess"
-          fi
-          if ! grep -q "AuthType Basic" "${DEPLOY_DIR}/.htaccess"; then
-            printf '\n# === Basic Auth ===\nAuthType Basic\nAuthName "Restricted Area"\nAuthUserFile %s\nRequire valid-user\n' "${HTPASSWD_PATH}" >> "${DEPLOY_DIR}/.htaccess"
-            echo "✅ .htaccess にBasic Auth設定を追加"
+          if [[ -f "$HTACCESS" ]]; then
+            sed -i "\|${BEGIN}|,\|${END}|d" "$HTACCESS"
           else
-            echo "✅ Basic Auth設定は既に存在します"
+            : > "$HTACCESS"
           fi
-          # .htpasswd の中身をファイルに書き出す（rsync後にSSHで配置）
-          echo "${BASIC_AUTH_USER}:${HASH}" > /tmp/.htpasswd
-          echo "✅ .htpasswd 生成完了 (配置先: ${HTPASSWD_PATH})"
 
-      # ─────────────────────────────────────────
-      # 8. SSL強制リダイレクト (.htaccess に追加)
-      # ─────────────────────────────────────────
-      - name: 🔒 Add SSL redirect to .htaccess
-        run: |
-          if [[ ! -f "${DEPLOY_DIR}/.htaccess" ]]; then
-            touch "${DEPLOY_DIR}/.htaccess"
-          fi
-          if ! grep -q "HTTPS.*off" "${DEPLOY_DIR}/.htaccess"; then
-            printf '\n# === SSL強制リダイレクト ===\nRewriteEngine On\nRewriteCond %%{HTTPS} off\nRewriteRule ^(.*)$ https://%%{HTTP_HOST}%%{REQUEST_URI} [R=301,L]\n' >> "${DEPLOY_DIR}/.htaccess"
-            echo "✅ SSL強制リダイレクト設定を追加"
+          BLOCK="$(mktemp)"
+          {
+            echo "$BEGIN"
+            echo "# このブロックは GitHub Actions が毎回生成します。手で編集しないでください。"
+            echo "RewriteEngine On"
+            echo "RewriteCond %{HTTPS} off"
+            echo "RewriteRule ^(.*)$ https://%{HTTP_HOST}%{REQUEST_URI} [R=301,L]"
+          } > "$BLOCK"
+
+          if [[ -n "$BASIC_AUTH_USER" && -n "$BASIC_AUTH_PASS" ]]; then
+            # bcrypt を使う。apr1(MD5) は現代の基準では弱いため。
+            if ! command -v htpasswd >/dev/null 2>&1; then
+              sudo apt-get update -qq && sudo apt-get install -y -qq apache2-utils || true
+            fi
+            if command -v htpasswd >/dev/null 2>&1; then
+              ENTRY="$(htpasswd -bnBC 10 "$BASIC_AUTH_USER" "$BASIC_AUTH_PASS")"
+            else
+              echo "::warning::htpasswd を利用できないため apr1(MD5) にフォールバックします。"
+              ENTRY="${BASIC_AUTH_USER}:$(openssl passwd -apr1 "$BASIC_AUTH_PASS")"
+            fi
+
+            # .htpasswd は公開ディレクトリの1つ上に置く（ブラウザから到達させない）。
+            # ファイル名には案件識別子を含め、同一ドメイン配下の他案件と衝突させない。
+            HTPASSWD_PATH="${PRIVATE_DIR}/${HTPASSWD_NAME}"
+            printf '%s\n' "$ENTRY" > "${RUNNER_TEMP}/.htpasswd"
+
+            {
+              echo ""
+              echo "AuthType Basic"
+              echo "AuthName \"Restricted Area\""
+              echo "AuthUserFile ${HTPASSWD_PATH}"
+              echo "Require valid-user"
+            } >> "$BLOCK"
+
+            echo "HTPASSWD_PATH=${HTPASSWD_PATH}" >> "$GITHUB_ENV"
+            echo "BASIC_AUTH_ENABLED=true" >> "$GITHUB_ENV"
+            echo "✅ Basic認証を有効化（.htpasswd 配置先: ${HTPASSWD_PATH}）"
           else
-            echo "✅ SSL強制リダイレクト設定は既に存在します"
+            echo "BASIC_AUTH_ENABLED=false" >> "$GITHUB_ENV"
+            echo "⏭  Basic認証の設定なし・スキップ"
           fi
 
-      # ─────────────────────────────────────────
-      # 9. ssh-agent に秘密鍵を登録
-      # ─────────────────────────────────────────
+          echo "$END" >> "$BLOCK"
+
+          # managed ブロックを先頭に置く（SSLリダイレクトを最優先で評価させる）
+          cat "$BLOCK" "$HTACCESS" > "${HTACCESS}.new"
+          mv "${HTACCESS}.new" "$HTACCESS"
+          echo "✅ .htaccess を生成しました"
+
       - name: 🔑 Setup SSH Agent
         uses: webfactory/ssh-agent@v0.9.0
         with:
           ssh-private-key: ${{ secrets.SSH_KEY }}
 
-      # ─────────────────────────────────────────
-      # 10. Xserverの known_hosts 登録
-      # ─────────────────────────────────────────
-      - name: 🌐 Add Xserver to known_hosts
+      # ssh-keyscan だけに頼るとホスト鍵を検証していないのと同じ（毎回相手を無条件に信頼する）。
+      # SSH_KNOWN_HOSTS があればそれを正とし、無ければ ssh-keyscan にフォールバックする。
+      #
+      # このテストサーバーでは SSH_KNOWN_HOSTS を意図的に設定していない。
+      # 中間者攻撃の成立には GitHub ランナーと Xserver 間の経路の掌握が必要で
+      # 現実的な確率が低い一方、転送物は Git にあるビルド成果物のみのため。
+      # そのため未設定は異常ではなく既定の運用であり、warning ではなく notice で記録する
+      # （毎回警告を出すと、本当に見るべき警告を見落とすようになる）。
+      #
+      # 方針を変えて検証を有効にする場合は、ランナーとは別の経路（手元のマシン）から
+      #   ssh-keyscan -p <PORT> <HOST>
+      # を実行し、その出力を Secrets の SSH_KNOWN_HOSTS に登録する。
+      - name: 🌐 Configure known_hosts
         run: |
           mkdir -p ~/.ssh
-          ssh-keyscan -p ${{ secrets.SSH_PORT }} -H ${{ secrets.SSH_HOST }} >> ~/.ssh/known_hosts
-          echo "✅ known_hosts 更新完了"
+          chmod 700 ~/.ssh
+          if [[ -n "$SSH_KNOWN_HOSTS" ]]; then
+            printf '%s\n' "$SSH_KNOWN_HOSTS" >> ~/.ssh/known_hosts
+            echo "✅ SSH_KNOWN_HOSTS からホスト鍵を登録しました"
+          else
+            echo "::notice::SSH_KNOWN_HOSTS は未設定です。ssh-keyscan にフォールバックします（テストサーバー運用のため意図的）。"
 
-      # ─────────────────────────────────────────
-      # 11. rsync でデプロイ
-      #     dist/ の中身のみ転送
-      # ─────────────────────────────────────────
-      - name: 🚀 Deploy via rsync
-        run: |
-          rsync -avz --delete \
-            --exclude='.git' \
-            --exclude='.github' \
-            --exclude='node_modules' \
-            --exclude='.DS_Store' \
-            --exclude='src' \
-            -e "ssh -p ${{ secrets.SSH_PORT }}" \
-            "${DEPLOY_DIR}/" \
-            "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:${REMOTE_PATH}/"
-          echo "✅ デプロイ完了: ${REMOTE_PATH}"
+            # ssh-keyscan は一時的なネットワーク障害やレート制限で失敗することがある。
+            # 失敗したまま進むと後続の ssh が原因不明で落ちるため、
+            # 数回リトライし、それでも駄目なら理由を示して明示的に止める。
+            scanned=""
+            for attempt in 1 2 3; do
+              err=""
+              if scanned="$(ssh-keyscan -p "$SSH_PORT" -H "$SSH_HOST" 2>/tmp/keyscan.err)" && [[ -n "$scanned" ]]; then
+                break
+              fi
+              err="$(cat /tmp/keyscan.err 2>/dev/null)"
+              echo "ssh-keyscan 失敗（${attempt}/3）: ${err:-出力なし}"
+              scanned=""
+              sleep 5
+            done
 
-      # ─────────────────────────────────────────
-      # 12. .htpasswd をドキュメントルート1つ上に配置
-      #     Basic Auth設定がある場合のみ実行
-      # ─────────────────────────────────────────
-      - name: 🔐 Place .htpasswd on server
-        env:
-          BASIC_AUTH_USER: ${{ secrets.BASIC_AUTH_USER }}
-        run: |
-          if [[ -z "$BASIC_AUTH_USER" ]]; then
-            echo "⏭  Basic Auth設定なし・スキップ"
-            exit 0
+            if [[ -z "$scanned" ]]; then
+              echo "::error::ssh-keyscan がホスト鍵を取得できませんでした（3回試行）。"
+              echo "::error::最後のエラー: ${err:-出力なし}"
+              echo "::error::SSH_HOST / SSH_PORT の値、またはサーバの到達性を確認してください。"
+              exit 1
+            fi
+
+            printf '%s\n' "$scanned" >> ~/.ssh/known_hosts
+            echo "✅ ssh-keyscan でホスト鍵を登録しました"
           fi
-          scp -P ${{ secrets.SSH_PORT }} \
-            /tmp/.htpasswd \
-            "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:${HTPASSWD_PATH}"
+          chmod 600 ~/.ssh/known_hosts
+
+      # テストサーバー運用のため、デプロイ先が無ければ自動作成する
+      # （新規リポジトリごとに手で mkdir する手間をなくす）。
+      #
+      # ただし「どこにでも掘ってよい」わけではない。親（PRIVATE_DIR、通常は
+      # ドメインのルート）が存在しない場合は REMOTE_BASE_PATH の打ち間違いと
+      # 判断して中止する。これにより mkdir -p が無関係な階層を
+      # 作ってしまう事故を防ぐ。
+      - name: 🛡️ Ensure remote directory
+        run: |
+          if ! ssh -p "$SSH_PORT" -o StrictHostKeyChecking=yes -o BatchMode=yes \
+                 "${SSH_USER}@${SSH_HOST}" "test -d '${PRIVATE_DIR}'"; then
+            echo "::error::親ディレクトリがサーバ上に存在しません: ${PRIVATE_DIR}"
+            echo "::error::REMOTE_BASE_PATH の打ち間違いが疑われるため中止します。"
+            exit 1
+          fi
+
+          if ssh -p "$SSH_PORT" -o StrictHostKeyChecking=yes -o BatchMode=yes \
+               "${SSH_USER}@${SSH_HOST}" "test -d '${REMOTE_PATH}'"; then
+            echo "✅ デプロイ先ディレクトリを確認しました: ${REMOTE_PATH}"
+          else
+            ssh -p "$SSH_PORT" -o StrictHostKeyChecking=yes -o BatchMode=yes \
+              "${SSH_USER}@${SSH_HOST}" "mkdir -p '${REMOTE_PATH}' && chmod 755 '${REMOTE_PATH}'"
+            echo "::notice::デプロイ先ディレクトリを新規作成しました: ${REMOTE_PATH}"
+          fi
+
+      # 本番反映の前に、何が転送され何が削除されるかを必ず可視化する。
+      - name: 🔍 Preview changes (rsync --dry-run)
+        run: |
+          rsync -rlpz --delete --itemize-changes --dry-run \
+            --no-owner --no-group --chmod=D755,F644 \
+            --exclude='.DS_Store' \
+            -e "ssh -p ${SSH_PORT} -o StrictHostKeyChecking=yes -o BatchMode=yes" \
+            "${DEPLOY_DIR}/" \
+            "${SSH_USER}@${SSH_HOST}:${REMOTE_PATH}/" \
+            > "${RUNNER_TEMP}/preview.txt"
+
+          DELETE_COUNT=$(grep -c '^\*deleting' "${RUNNER_TEMP}/preview.txt" || true)
+          UPLOAD_COUNT=$(grep -cE '^[<>]' "${RUNNER_TEMP}/preview.txt" || true)
+          echo "DELETE_COUNT=${DELETE_COUNT}" >> "$GITHUB_ENV"
+          echo "UPLOAD_COUNT=${UPLOAD_COUNT}" >> "$GITHUB_ENV"
+
+          {
+            echo "### 🔍 反映プレビュー"
+            echo ""
+            echo "- 転送予定: **${UPLOAD_COUNT}** 件"
+            echo "- 削除予定: **${DELETE_COUNT}** 件"
+            echo ""
+            if (( DELETE_COUNT > 0 )); then
+              echo "<details><summary>削除されるファイル（先頭200件）</summary>"
+              echo ""
+              echo '```'
+              grep '^\*deleting' "${RUNNER_TEMP}/preview.txt" | sed 's/^\*deleting *//' | head -200
+              echo '```'
+              echo ""
+              echo "</details>"
+              echo ""
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # DELETE_THRESHOLD=0 のときはガードを行わず、件数の可視化だけ行う
+          if (( DELETE_THRESHOLD > 0 )) && (( DELETE_COUNT > DELETE_THRESHOLD )) && [[ "${{ inputs.force }}" != "true" ]]; then
+            echo "::error::削除予定 ${DELETE_COUNT} 件が閾値 ${DELETE_THRESHOLD} 件を超えました。"
+            echo "::error::REMOTE_BASE_PATH の誤りが疑われます。意図した削除であれば、"
+            echo "::error::workflow_dispatch から force を有効にして再実行してください。"
+            exit 1
+          fi
+          echo "✅ プレビュー完了（転送 ${UPLOAD_COUNT} 件 / 削除 ${DELETE_COUNT} 件）"
+
+      # rsync より先に配置する。
+      # .htaccess は AuthUserFile としてこのファイルを参照するため、後に置くと
+      # 参照先が存在しない状態が生まれ、その間 Apache は 500 を返す。
+      # scp が失敗した場合もサイトを壊さずに済む。
+      - name: 🔐 Place .htpasswd on server
+        if: ${{ inputs.dry_run != true && env.BASIC_AUTH_ENABLED == 'true' }}
+        run: |
+          scp -P "$SSH_PORT" -o StrictHostKeyChecking=yes -o BatchMode=yes \
+            "${RUNNER_TEMP}/.htpasswd" \
+            "${SSH_USER}@${SSH_HOST}:${HTPASSWD_PATH}"
+          ssh -p "$SSH_PORT" -o StrictHostKeyChecking=yes -o BatchMode=yes \
+            "${SSH_USER}@${SSH_HOST}" "chmod 644 '${HTPASSWD_PATH}'"
           echo "✅ .htpasswd 配置完了: ${HTPASSWD_PATH}"
 
-      # ─────────────────────────────────────────
-      # 13. デプロイ結果をサマリーに表示
-      # ─────────────────────────────────────────
+      # --chmod=D755,F644 : runner側のパーミッションを持ち込むと共有ホスティングで403になり得る
+      #
+      # サーバ側の世代バックアップは持たない。テストサーバーの内容は dist/ を
+      # 転送したものであり、復旧は該当コミットへ戻して再デプロイする方が速く確実。
+      # そのため --delete は不可逆になる点に注意（転送内容は直前のプレビューで確認する）。
+      - name: 🚀 Deploy via rsync
+        if: ${{ inputs.dry_run != true }}
+        run: |
+          rsync -rlpvz --delete \
+            --no-owner --no-group --chmod=D755,F644 \
+            --exclude='.DS_Store' \
+            --human-readable --stats \
+            -e "ssh -p ${SSH_PORT} -o StrictHostKeyChecking=yes -o BatchMode=yes" \
+            "${DEPLOY_DIR}/" \
+            "${SSH_USER}@${SSH_HOST}:${REMOTE_PATH}/"
+
+          echo "✅ デプロイ完了: ${REMOTE_PATH}"
+
+      # 過去の版が残した不要ファイルを掃除する。
+      #   - LEGACY_DIR/.htpasswd     : 退避先を公開領域の外へ移す前に置かれたもの
+      #   - PRIVATE_DIR/.htpasswd    : 案件別の名前に切り替える前の共有ファイル
+      #   - .deploy-backup           : 世代バックアップを廃止したため両方の場所で不要
+      #
+      # rsync 成功後に実行する。デプロイが失敗した場合は旧 .htpasswd を残し、
+      # 古い .htaccess が参照し続けても認証が外れないようにする。
+      - name: 🧹 Clean up obsolete files
+        if: ${{ inputs.dry_run != true }}
+        continue-on-error: true
+        run: |
+          # 消すのは deploy-kit が生成したものだけに限定する。
+          # ディレクトリ自体には利用者のファイルがあるため触らない。
+          targets=("${PRIVATE_DIR}/.deploy-backup")
+          if [[ "$LEGACY_DIR" != "$PRIVATE_DIR" ]]; then
+            targets+=("${LEGACY_DIR}/.htpasswd" "${LEGACY_DIR}/.deploy-backup")
+          fi
+
+          # 案件別の名前へ移行したことで不要になった共有 .htpasswd。
+          # HTPASSWD_NAME が .htpasswd のまま（public_html 直下へのデプロイ）の場合は
+          # 今まさに使っているファイルなので、絶対に削除対象へ入れない。
+          if [[ "$HTPASSWD_NAME" != ".htpasswd" ]]; then
+            targets+=("${PRIVATE_DIR}/.htpasswd")
+          fi
+
+          cmd=""
+          for t in "${targets[@]}"; do
+            cmd+="rm -rf '${t}'; "
+          done
+
+          ssh -p "$SSH_PORT" -o StrictHostKeyChecking=yes -o BatchMode=yes \
+            "${SSH_USER}@${SSH_HOST}" "$cmd"
+
+          printf '✅ 不要ファイルを削除しました:\n'
+          printf '   - %s\n' "${targets[@]}"
+
       - name: 📊 Deploy Summary
         if: always()
         run: |
-          echo "## 🚀 デプロイ結果" >> $GITHUB_STEP_SUMMARY
-          echo "| 項目 | 値 |" >> $GITHUB_STEP_SUMMARY
-          echo "|------|-----|" >> $GITHUB_STEP_SUMMARY
-          echo "| ブランチ | \`${{ github.ref_name }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| コミット | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| 実行者 | ${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| ステータス | ${{ job.status }} |" >> $GITHUB_STEP_SUMMARY
+          {
+            echo "## 🚀 デプロイ結果"
+            echo ""
+            echo "| 項目 | 値 |"
+            echo "|------|-----|"
+            echo "| ステータス | ${{ job.status }} |"
+            echo "| ブランチ | \`${{ github.ref_name }}\` |"
+            echo "| デプロイ先 | \`${DISPLAY_PATH:-未確定}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"

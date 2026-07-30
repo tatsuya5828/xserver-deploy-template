@@ -1,6 +1,9 @@
 # ============================================================
 # ③⑤ WordPress テーマ開発用 GitHub Actions デプロイワークフロー
-#     wordpress/themes/{THEME_NAME}/ をXserverのWPテーマへ同期
+#     wordpress/themes/{themeSlug}/ をXserverのWPテーマへ同期
+#
+#     テーマ名は config/project.json の themeSlug を正としています
+#     （vite.config.js / bin/utils/paths.js と同じ取得元）
 #
 # 必要なSecrets:
 #   SSH_HOST        : Xserverホスト名 (例: sv12345.xserver.jp)
@@ -9,6 +12,13 @@
 #   SSH_KEY         : SSH秘密鍵（全文）
 #   REMOTE_BASE_PATH: WordPressのルートパス ※末尾スラッシュなし・絶対パス
 #                     例: /home/xs123456/example.com/public_html
+#
+# 任意のSecrets:
+#   SSH_KNOWN_HOSTS : サーバーのホスト鍵（`ssh-keyscan -p 10022 <host>` の出力全文）
+#                     未設定だと毎回その場の鍵を無条件に信頼します（中間者攻撃を検出不可）
+#   SITE_URL        : デプロイ後の疎通確認先 (例: https://example.com)
+#                     設定すると .htaccess 破損（5xx）と
+#                     SSL強制リダイレクトの動作を毎回検証します
 #   BASIC_AUTH_USER : Basic認証ユーザー名（省略時はスキップ）
 #   BASIC_AUTH_PASS : Basic認証パスワード（省略時はスキップ）
 # ============================================================
@@ -18,13 +28,32 @@ on:
   push:
     branches:
       - main
+    paths-ignore:
+      - '**.md'
+      - 'doc/**'
+      - '.vscode/**'
   workflow_dispatch:
+
+# GITHUB_TOKEN は読み取りのみに絞る
+permissions:
+  contents: read
+
+# 連続 push で rsync が同一ディレクトリに並走しないようにキューイングする
+# （進行中のデプロイを中断すると中途半端な状態が残るため cancel はしない）
+concurrency:
+  group: deploy-wp-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   deploy:
-    name: rsync → wp-content/themes/<repo>
+    name: rsync → wp-content/themes/<themeSlug>
     runs-on: ubuntu-latest
     timeout-minutes: 15
+
+    # -eo pipefail を有効化（既定の `bash -e` はパイプ途中の失敗を拾わない）
+    defaults:
+      run:
+        shell: bash
 
     steps:
       # ─────────────────────────────────────────
@@ -34,12 +63,32 @@ jobs:
         uses: actions/checkout@v4
 
       # ─────────────────────────────────────────
-      # 2. リポジトリ名をテーマ名として使用
+      # 2. config/project.json からテーマ名を取得
+      #    ビルド側（vite.config.js → bin/utils/paths.js）と同じ取得元にする
+      #    ※リポジトリ名から導出すると、リポジトリ名と themeSlug が
+      #      食い違った瞬間にビルド出力先と rsync 元がズレる
       # ─────────────────────────────────────────
-      - name: 📝 Set theme name from repo
+      - name: 📝 Set theme name from config
         id: theme
         run: |
-          THEME_NAME="${GITHUB_REPOSITORY##*/}"
+          if [[ ! -f config/project.json ]]; then
+            echo '❌ config/project.json がありません（yarn init:project で作成してください）'
+            exit 1
+          fi
+
+          THEME_NAME=$(node -p "require('./config/project.json').themeSlug")
+
+          if [[ -z "${THEME_NAME}" || "${THEME_NAME}" == "undefined" ]]; then
+            echo "❌ config/project.json の themeSlug が空です"
+            exit 1
+          fi
+
+          if [[ ! -d "wordpress/themes/${THEME_NAME}" ]]; then
+            echo "❌ wordpress/themes/${THEME_NAME}/ が存在しません"
+            echo "   themeSlug とテーマディレクトリ名を合わせてください（yarn update:wp-config）"
+            exit 1
+          fi
+
           echo "name=${THEME_NAME}" >> $GITHUB_OUTPUT
           echo "✅ テーマ名: ${THEME_NAME}"
 
@@ -52,33 +101,33 @@ jobs:
           node-version: '22.x'
 
       # ─────────────────────────────────────────
-      # 4. node_modules キャッシュ
-      #    2回目以降の yarn install を高速化
+      # 4. Yarn キャッシュ
+      #    nodeLinker: node-modules のため node_modules 自体はキャッシュしない
+      #    （restore-keys で古い node_modules を復元すると不整合が残るため、
+      #      .yarn/cache だけ持って install で決定的に再構成する）
       # ─────────────────────────────────────────
-      - name: 💾 Cache node_modules
+      - name: 💾 Cache Yarn
         uses: actions/cache@v4
         with:
-          path: |
-            node_modules
-            .yarn/cache
-            .pnp.cjs
-            .pnp.loader.mjs
+          path: .yarn/cache
           key: ${{ runner.os }}-yarn-${{ hashFiles('yarn.lock') }}
           restore-keys: |
             ${{ runner.os }}-yarn-
 
       # ─────────────────────────────────────────
       # 5. 依存関係インストール
+      #    --immutable で yarn.lock の書き換えを禁止（CI では既定だが明示する）
       # ─────────────────────────────────────────
       - name: 📦 Install dependencies
         run: |
           corepack enable
-          yarn install
+          yarn install --immutable
           echo "✅ 依存関係インストール完了"
 
       # ─────────────────────────────────────────
       # 6. 品質チェック
       #    コードの乱れ・ACF設定の不備を事前検出
+      #    ※自動整形はしない。ローカルで `yarn format` を実行してからコミットすること
       # ─────────────────────────────────────────
       - name: 🔍 Quality Check
         continue-on-error: false
@@ -88,32 +137,76 @@ jobs:
           echo "✅ 品質チェック完了"
 
       # ─────────────────────────────────────────
-      # 7. ビルド
-      #    yarn build:wp → wordpress/themes/{THEME_NAME}/assets/ に出力
+      # 7. ビルド + 成果物の検証
+      #    yarn build:wp → wordpress/themes/{themeSlug}/assets/ に出力
+      #    壊れた成果物を --delete 付き rsync で送らないよう、ここで止める
       # ─────────────────────────────────────────
       - name: 🏗️ Build
+        env:
+          THEME_NAME: ${{ steps.theme.outputs.name }}
         run: |
           yarn build:wp
           echo "✅ ビルド完了"
-          # manifest.dev.json が残っていないか確認（本番混入防止）
-          THEME_NAME="${GITHUB_REPOSITORY##*/}"
-          if [[ -f "wordpress/themes/${THEME_NAME}/assets/manifest.dev.json" ]]; then
-            echo "❌ manifest.dev.json が残っています！削除します"
-            rm "wordpress/themes/${THEME_NAME}/assets/manifest.dev.json"
+
+          THEME_DIR="wordpress/themes/${THEME_NAME}"
+
+          # 開発用 manifest が残っていないか（テーマ直下。assets/ 配下ではない）
+          if [[ -f "${THEME_DIR}/manifest.dev.json" ]]; then
+            echo "::warning::manifest.dev.json が残っていたため削除します"
+            rm -f "${THEME_DIR}/manifest.dev.json"
           fi
-          if [[ -d "wordpress/themes/${THEME_NAME}/assets/.vite" ]]; then
-            rm -rf "wordpress/themes/${THEME_NAME}/assets/.vite"
+
+          # ハッシュ付き成果物が生成されたか
+          shopt -s nullglob
+          JS_FILES=("${THEME_DIR}"/assets/js/script.*.js)
+          CSS_FILES=("${THEME_DIR}"/assets/styles/style.*.css)
+
+          if [[ ${#JS_FILES[@]} -eq 0 || ${#CSS_FILES[@]} -eq 0 ]]; then
+            echo "❌ ビルド成果物が見つかりません（JS: ${#JS_FILES[@]} 件 / CSS: ${#CSS_FILES[@]} 件）"
+            exit 1
           fi
+
+          # 本番のアセット読み込みは .vite/manifest.json を参照する
+          # （functions-lib/func-helpers.php: get_template_directory() . "/.vite/manifest.json"）
+          # これが無いと get_asset_environment() が fallback に落ちる
+          if [[ ! -f "${THEME_DIR}/.vite/manifest.json" ]]; then
+            echo "❌ .vite/manifest.json がありません（本番の manifest 読み込みに必要）"
+            exit 1
+          fi
+
+          echo "✅ ビルド検証 OK"
+          echo "   JS : ${JS_FILES[*]##*/}"
+          echo "   CSS: ${CSS_FILES[*]##*/}"
 
       # ─────────────────────────────────────────
       # 8. REMOTE_BASE_PATH の末尾スラッシュを除去
+      #    ※末尾を削ると Secret と文字列一致しなくなりログのマスクが外れるため
+      #      加工後の値を明示的に add-mask する
       # ─────────────────────────────────────────
       - name: 🔧 Normalize REMOTE_BASE_PATH
+        env:
+          REMOTE_BASE_PATH: ${{ secrets.REMOTE_BASE_PATH }}
         run: |
-          REMOTE_PATH="${{ secrets.REMOTE_BASE_PATH }}"
-          REMOTE_PATH="${REMOTE_PATH%/}"
+          REMOTE_PATH="${REMOTE_BASE_PATH%/}"
+
+          if [[ -z "${REMOTE_PATH}" ]]; then
+            echo "❌ Secret REMOTE_BASE_PATH が未設定です"
+            exit 1
+          fi
+
+          # .htpasswd は REMOTE_PATH の 1 つ上に置くが、そこはドメイン単位で
+          # 共通のため、同一ドメイン配下で複数案件を運用すると互いに上書きし、
+          # 先にデプロイした案件の Basic 認証が壊れる。
+          # サイトルートのディレクトリ名をファイル名に含めて衝突を避ける。
+          #   .../example.xsrv.jp/public_html        -> .htpasswd-public_html
+          #   .../example.xsrv.jp/public_html/site-a -> .htpasswd-site-a
+          HTPASSWD_NAME=".htpasswd-$(basename "${REMOTE_PATH}")"
+
+          echo "::add-mask::${REMOTE_PATH}"
           echo "REMOTE_PATH=${REMOTE_PATH}" >> $GITHUB_ENV
-          echo "✅ デプロイ先: ${REMOTE_PATH}"
+          echo "HTPASSWD_NAME=${HTPASSWD_NAME}" >> $GITHUB_ENV
+          echo "✅ デプロイ先を設定しました"
+          echo "✅ .htpasswd ファイル名: ${HTPASSWD_NAME}"
 
       # ─────────────────────────────────────────
       # 9. Basic Auth ハッシュ生成
@@ -127,9 +220,20 @@ jobs:
             echo "⏭  Basic Auth設定なし・スキップ"
             exit 0
           fi
-          HASH=$(openssl passwd -apr1 "$BASIC_AUTH_PASS")
-          echo "${BASIC_AUTH_USER}:${HASH}" > /tmp/.htpasswd
-          echo "✅ Basic Auth ハッシュ生成完了"
+          # bcrypt を使う。apr1(MD5) は現代の基準では弱いため。
+          if ! command -v htpasswd >/dev/null 2>&1; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq apache2-utils || true
+          fi
+
+          if command -v htpasswd >/dev/null 2>&1; then
+            htpasswd -bnBC 10 "$BASIC_AUTH_USER" "$BASIC_AUTH_PASS" > /tmp/.htpasswd
+            echo "✅ Basic Auth ハッシュ生成完了（bcrypt）"
+          else
+            echo "::warning::htpasswd を利用できないため apr1(MD5) にフォールバックします。"
+            HASH=$(openssl passwd -apr1 "$BASIC_AUTH_PASS")
+            echo "${BASIC_AUTH_USER}:${HASH}" > /tmp/.htpasswd
+            echo "✅ Basic Auth ハッシュ生成完了（apr1）"
+          fi
 
       # ─────────────────────────────────────────
       # 10. ssh-agent に秘密鍵を登録
@@ -140,57 +244,75 @@ jobs:
           ssh-private-key: ${{ secrets.SSH_KEY }}
 
       # ─────────────────────────────────────────
-      # 11. Xserverの known_hosts 登録
+      # 11. known_hosts 登録
+      #     Secret があればそれを使う（＝ホスト鍵を検証できる）
+      #     無い場合は従来どおり ssh-keyscan するが、
+      #     これは「その場で提示された鍵を無条件に信頼する」動作で
+      #     中間者攻撃を検出できないため警告を出す
       # ─────────────────────────────────────────
-      - name: 🌐 Add Xserver to known_hosts
+      - name: 🌐 Setup known_hosts
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
         run: |
           mkdir -p ~/.ssh
-          ssh-keyscan -p ${{ secrets.SSH_PORT }} -H ${{ secrets.SSH_HOST }} >> ~/.ssh/known_hosts
-          echo "✅ known_hosts 更新完了"
+          chmod 700 ~/.ssh
 
-      # ─────────────────────────────────────────
-      # 12. SSL強制リダイレクト + Basic Auth
-      #     サーバー上のWPルートの .htaccess に設定
-      #     .htpasswd は public_html の1つ上に配置
-      #     ※ブラウザから絶対にアクセスできない場所
-      # ─────────────────────────────────────────
-      - name: 🔒 Setup .htaccess on server
-        env:
-          BASIC_AUTH_USER: ${{ secrets.BASIC_AUTH_USER }}
-        run: |
-          PARENT_PATH=$(dirname "${REMOTE_PATH}")
-          HTPASSWD_PATH="${PARENT_PATH}/.htpasswd"
-
-          ssh -p ${{ secrets.SSH_PORT }} \
-            ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
-            "bash -s" << SSHEOF
-          HTACCESS="${REMOTE_PATH}/.htaccess"
-
-          if [[ ! -f "\${HTACCESS}" ]]; then touch "\${HTACCESS}"; fi
-
-          # SSL強制リダイレクト（重複チェック）
-          if ! grep -q "HTTPS.*off" "\${HTACCESS}"; then
-            printf '\n# === SSL強制リダイレクト ===\nRewriteEngine On\nRewriteCond %%{HTTPS} off\nRewriteRule ^(.*)\$ https://%%{HTTP_HOST}%%{REQUEST_URI} [R=301,L]\n' >> "\${HTACCESS}"
-            echo "✅ SSL強制リダイレクト追加"
+          if [[ -n "$SSH_KNOWN_HOSTS" ]]; then
+            printf '%s\n' "$SSH_KNOWN_HOSTS" >> ~/.ssh/known_hosts
+            echo "✅ known_hosts を Secret から登録（ホスト鍵を検証します）"
           else
-            echo "✅ SSL強制リダイレクトは既に存在します"
+            # 未設定は異常ではなく、テストサーバーでの既定の運用。
+            # 毎回警告を出すと本当に見るべき警告を見落とすため notice で記録する。
+            echo "::notice::SSH_KNOWN_HOSTS は未設定です。ssh-keyscan にフォールバックします（テストサーバー運用のため意図的）。"
+
+            # ssh-keyscan は一時的なネットワーク障害やレート制限で失敗することがある。
+            # 失敗したまま進むと後続の ssh が原因不明で落ちるため、
+            # 数回リトライし、それでも駄目なら理由を示して明示的に止める。
+            # 全ての ssh/scp/rsync が StrictHostKeyChecking=yes で動くため、
+            # ここで鍵を取得できないとデプロイ全体が失敗する。
+            # 間欠的な失敗に耐えるよう試行回数を多めに取る。
+            scanned=""
+            for attempt in 1 2 3 4 5; do
+              err=""
+              if scanned="$(ssh-keyscan -p "$SSH_PORT" -H "$SSH_HOST" 2>/tmp/keyscan.err)" && [[ -n "$scanned" ]]; then
+                break
+              fi
+              err="$(cat /tmp/keyscan.err 2>/dev/null)"
+              echo "ssh-keyscan 失敗（${attempt}/5）: ${err:-出力なし}"
+              scanned=""
+              sleep 5
+            done
+
+            if [[ -z "$scanned" ]]; then
+              echo "::error::ssh-keyscan がホスト鍵を取得できませんでした（5回試行）。"
+              echo "::error::最後のエラー: ${err:-出力なし}"
+              echo "::error::SSH_HOST / SSH_PORT の値、またはサーバの到達性を確認してください。"
+              exit 1
+            fi
+
+            printf '%s\n' "$scanned" >> ~/.ssh/known_hosts
+            echo "✅ ssh-keyscan でホスト鍵を登録しました"
           fi
 
-          # Basic Auth（重複チェック）
-          if [[ -n "${BASIC_AUTH_USER}" ]] && ! grep -q "AuthType Basic" "\${HTACCESS}"; then
-            printf '\n# === Basic Auth ===\nAuthType Basic\nAuthName "Restricted Area"\nAuthUserFile %s\nRequire valid-user\n' "${HTPASSWD_PATH}" >> "\${HTACCESS}"
-            echo "✅ Basic Auth設定追加"
-          else
-            echo "✅ Basic Auth設定は既に存在するかスキップ"
-          fi
-          SSHEOF
+          chmod 600 ~/.ssh/known_hosts
 
       # ─────────────────────────────────────────
-      # 13. .htpasswd をドキュメントルート1つ上に配置
-      #     Basic Auth設定がある場合のみ実行
+      # 11.5 .htpasswd をドキュメントルート1つ上に配置
+      #      Basic Auth設定がある場合のみ実行
+      #
+      #      .htaccess の更新より先に置く。
+      #      .htaccess は AuthUserFile としてこのファイルを参照するため、
+      #      後に置くと参照先が存在しない状態が生まれ、
+      #      その間 Apache は 500 を返す。
+      #      scp が失敗した場合もサイトを壊さずに済む
       # ─────────────────────────────────────────
       - name: 🔐 Place .htpasswd on server
         env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_USER: ${{ secrets.SSH_USER }}
           BASIC_AUTH_USER: ${{ secrets.BASIC_AUTH_USER }}
         run: |
           if [[ -z "$BASIC_AUTH_USER" ]]; then
@@ -198,31 +320,358 @@ jobs:
             exit 0
           fi
           PARENT_PATH=$(dirname "${REMOTE_PATH}")
-          HTPASSWD_PATH="${PARENT_PATH}/.htpasswd"
-          scp -P ${{ secrets.SSH_PORT }} \
-            /tmp/.htpasswd \
-            "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:${HTPASSWD_PATH}"
-          echo "✅ .htpasswd 配置完了: ${HTPASSWD_PATH}"
+          HTPASSWD_PATH="${PARENT_PATH}/${HTPASSWD_NAME}"
+          scp -P "$SSH_PORT" -o StrictHostKeyChecking=yes -o BatchMode=yes /tmp/.htpasswd "${SSH_USER}@${SSH_HOST}:${HTPASSWD_PATH}"
+          ssh -p "$SSH_PORT" -o StrictHostKeyChecking=yes -o BatchMode=yes "${SSH_USER}@${SSH_HOST}" "chmod 644 '${HTPASSWD_PATH}'"
+          echo "✅ .htpasswd 配置完了: ${HTPASSWD_NAME}"
+
+      # ─────────────────────────────────────────
+      # 12. SSL強制リダイレクト + Basic Auth を .htaccess に設定
+      #
+      #     ※ WordPress ブロックの `RewriteRule . /index.php [L]` が先に一致すると
+      #        その後ろに書いたリライトルールは通常のページ表示で評価されない。
+      #        そのため末尾追記ではなく `# BEGIN WordPress` の直前に挿入する
+      #     ※ 旧版が末尾に追記したブロックは自動で移行する。
+      #        マーカーから EOF まで消すと無関係な記述を巻き込むため、
+      #        旧版が生成したはずの内容を完全再現し、それと一致する連続行だけを削除する。
+      #        一致しない（手で編集された）場合は何もせず警告だけ出す
+      #     ※ 変更前に .htaccess をバックアップ（直近5世代を保持）
+      #     ※ Basic Auth は wp-cron.php を除外する
+      #        （除外しないとループバック実行が 401 になり予約投稿・定期処理が止まる）
+      #     ※ 値はヒアドキュメントを quote した上で位置パラメータ渡しにして
+      #        リモート側での意図しない展開を防ぐ
+      # ─────────────────────────────────────────
+      - name: 🔒 Setup .htaccess on server
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          BASIC_AUTH_USER: ${{ secrets.BASIC_AUTH_USER }}
+        run: |
+          PARENT_PATH=$(dirname "${REMOTE_PATH}")
+          HTPASSWD_PATH="${PARENT_PATH}/${HTPASSWD_NAME}"
+
+          ssh -p "$SSH_PORT" -o StrictHostKeyChecking=yes -o BatchMode=yes "${SSH_USER}@${SSH_HOST}" \
+            "bash -s -- '${REMOTE_PATH}' '${HTPASSWD_PATH}' '${BASIC_AUTH_USER}'" << 'SSHEOF'
+          set -euo pipefail
+
+          WP_ROOT="$1"
+          HTPASSWD_PATH="$2"
+          BASIC_AUTH_USER="${3:-}"
+
+          HTACCESS="${WP_ROOT}/.htaccess"
+          [ -f "$HTACCESS" ] || touch "$HTACCESS"
+
+          # 変更前にバックアップし、直近5世代だけ残す
+          cp "$HTACCESS" "${HTACCESS}.bak.$(date +%Y%m%d-%H%M%S)"
+          ls -1t "${HTACCESS}".bak.* 2>/dev/null | tail -n +6 | xargs -r rm -f || true
+
+          WORK_DIR=$(mktemp -d)
+          trap 'rm -rf "$WORK_DIR"' EXIT
+
+          # 開始/終了マーカーで囲んだブロックを、常に WordPress ブロックの直前へ配置し直す
+          # （毎回 削除→再挿入 することで内容・位置ともに宣言的に収束させる）
+          # ブロック本文はファイルで渡す。awk -v に複数行の値を渡すと
+          # 実装によっては "newline in string" で失敗するため
+          # 旧バージョンが末尾に追記した「終了マーカー無し」のブロックを除去する。
+          # マーカーから EOF まで消すと無関係な記述を巻き込むため、
+          # 旧版が生成したはずの内容を完全再現し、それと一致する連続行だけを削除する。
+          # 一致しなければ（手で編集された等）何もせず 1 を返す
+          remove_legacy_exact() {
+            legacy_file="$1"
+
+            awk -v legacy="$legacy_file" '
+              BEGIN {
+                n = 0
+                while ((getline line < legacy) > 0) { legacy_lines[++n] = line }
+              }
+              { lines[NR] = $0 }
+              END {
+                found = 0
+                for (i = 1; i <= NR - n + 1; i++) {
+                  ok = 1
+                  for (j = 1; j <= n; j++) {
+                    if (lines[i + j - 1] != legacy_lines[j]) { ok = 0; break }
+                  }
+                  if (ok) { found = i; break }
+                }
+                for (i = 1; i <= NR; i++) {
+                  if (found && i >= found && i < found + n) { continue }
+                  print lines[i]
+                }
+                exit (found ? 0 : 1)
+              }
+            ' "$HTACCESS" > "${HTACCESS}.tmp"
+          }
+
+          sync_block() {
+            start="$1"
+            end="$2"
+            block_file="$3"
+            legacy_file="${4:-}"
+
+            if grep -qF "$start" "$HTACCESS"; then
+              if grep -qF "$end" "$HTACCESS"; then
+                awk -v s="$start" -v e="$end" '
+                  $0 == s { skipping = 1 }
+                  skipping == 0 { print }
+                  $0 == e { skipping = 0 }
+                ' "$HTACCESS" > "${HTACCESS}.tmp"
+                mv "${HTACCESS}.tmp" "$HTACCESS"
+              elif [ -n "$legacy_file" ] && remove_legacy_exact "$legacy_file"; then
+                mv "${HTACCESS}.tmp" "$HTACCESS"
+                echo "  旧形式を検出したため除去しました（正しい位置に作り直します）: $start"
+              else
+                rm -f "${HTACCESS}.tmp"
+                echo "::warning::${start} が旧形式で存在し、内容が想定と一致しません（手動で編集された可能性）"
+                echo "  巻き込み事故を避けるため自動削除しません。手動で取り除いてください"
+                return 0
+              fi
+            fi
+
+            if grep -qF '# BEGIN WordPress' "$HTACCESS"; then
+              BEGIN_LINE=$(grep -nF '# BEGIN WordPress' "$HTACCESS" | head -1 | cut -d: -f1)
+              # WordPress ブロックが1行目のときは前半が空。
+              # `head -n 0` を受け付けない実装があるため分岐する
+              if [ "$BEGIN_LINE" -gt 1 ]; then
+                head -n "$((BEGIN_LINE - 1))" "$HTACCESS" > "${HTACCESS}.tmp"
+              else
+                : > "${HTACCESS}.tmp"
+              fi
+              cat "$block_file" >> "${HTACCESS}.tmp"
+              printf '\n' >> "${HTACCESS}.tmp"
+              tail -n "+${BEGIN_LINE}" "$HTACCESS" >> "${HTACCESS}.tmp"
+            else
+              cat "$block_file" > "${HTACCESS}.tmp"
+              printf '\n' >> "${HTACCESS}.tmp"
+              cat "$HTACCESS" >> "${HTACCESS}.tmp"
+            fi
+
+            mv "${HTACCESS}.tmp" "$HTACCESS"
+            echo "  設定: $start"
+          }
+
+          cat > "${WORK_DIR}/ssl.conf" << 'BLOCKEOF'
+          # === SSL強制リダイレクト ===
+          <IfModule mod_rewrite.c>
+          RewriteEngine On
+          RewriteCond %{HTTPS} off
+          RewriteRule ^(.*)$ https://%{HTTP_HOST}%{REQUEST_URI} [R=301,L]
+          </IfModule>
+          # === /SSL強制リダイレクト ===
+          BLOCKEOF
+
+          # 旧版が末尾に printf で追記していた内容（そのままの並び）。
+          # これと完全一致した場合のみ自動除去の対象にする
+          cat > "${WORK_DIR}/ssl.legacy" << 'BLOCKEOF'
+          # === SSL強制リダイレクト ===
+          RewriteEngine On
+          RewriteCond %{HTTPS} off
+          RewriteRule ^(.*)$ https://%{HTTP_HOST}%{REQUEST_URI} [R=301,L]
+          BLOCKEOF
+
+          sync_block '# === SSL強制リダイレクト ===' '# === /SSL強制リダイレクト ===' \
+            "${WORK_DIR}/ssl.conf" "${WORK_DIR}/ssl.legacy"
+
+          if [ -n "$BASIC_AUTH_USER" ]; then
+            cat > "${WORK_DIR}/auth.conf" << BLOCKEOF
+          # === Basic Auth ===
+          AuthType Basic
+          AuthName "Restricted Area"
+          AuthUserFile ${HTPASSWD_PATH}
+          Require valid-user
+          <Files "wp-cron.php">
+          Require all granted
+          </Files>
+          # === /Basic Auth ===
+          BLOCKEOF
+
+            cat > "${WORK_DIR}/auth.legacy" << BLOCKEOF
+          # === Basic Auth ===
+          AuthType Basic
+          AuthName "Restricted Area"
+          AuthUserFile ${HTPASSWD_PATH}
+          Require valid-user
+          BLOCKEOF
+
+            sync_block '# === Basic Auth ===' '# === /Basic Auth ===' \
+              "${WORK_DIR}/auth.conf" "${WORK_DIR}/auth.legacy"
+          else
+            echo "  スキップ: Basic Auth 設定なし"
+          fi
+
+          # 削除→再挿入を繰り返しても空行が増えないよう、連続空行を1行に畳み
+          # 先頭の空行を取り除く
+          cat -s "$HTACCESS" | awk 'NF || body { body = 1; print }' > "${HTACCESS}.tmp"
+          mv "${HTACCESS}.tmp" "$HTACCESS"
+
+          echo "✅ .htaccess 設定完了"
+          SSHEOF
+
+      # ─────────────────────────────────────────
+      # 13. 案件別の名前へ移行したことで不要になった .htpasswd を削除
+      #
+      #     .htaccess が新しい名前を参照するようになった後に実行する。
+      #     先に消すと、.htaccess 更新までの間 AuthUserFile の参照先が
+      #     存在せず Apache が 500 を返す
+      # ─────────────────────────────────────────
+      - name: 🧹 Clean up obsolete .htpasswd
+        continue-on-error: true
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          BASIC_AUTH_USER: ${{ secrets.BASIC_AUTH_USER }}
+        run: |
+          if [[ -z "$BASIC_AUTH_USER" ]]; then
+            echo "⏭  Basic Auth設定なし・スキップ"
+            exit 0
+          fi
+
+          PARENT_PATH=$(dirname "${REMOTE_PATH}")
+          LEGACY_PATH="${PARENT_PATH}/.htpasswd"
+
+          # 新しい名前が .htpasswd そのものになることはない
+          # （必ず .htpasswd-<案件名> 形式）が、万一一致する場合は
+          # 今まさに使っているファイルなので消さない
+          if [[ "$HTPASSWD_NAME" == ".htpasswd" ]]; then
+            echo "⏭  新旧が同名のためスキップ"
+            exit 0
+          fi
+
+          ssh -p "$SSH_PORT" -o StrictHostKeyChecking=yes -o BatchMode=yes "${SSH_USER}@${SSH_HOST}" "rm -f '${LEGACY_PATH}'"
+          echo "✅ 旧ファイルを削除しました: ${LEGACY_PATH}"
 
       # ─────────────────────────────────────────
       # 14. テーマディレクトリをリモートで事前作成
       # ─────────────────────────────────────────
       - name: 📁 Create theme directory on server
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          THEME_NAME: ${{ steps.theme.outputs.name }}
         run: |
-          THEME_NAME="${{ steps.theme.outputs.name }}"
           THEME_PATH="${REMOTE_PATH}/wp-content/themes/${THEME_NAME}"
-          ssh -p ${{ secrets.SSH_PORT }} \
-            ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
-            "mkdir -p ${THEME_PATH}"
-          echo "✅ ディレクトリ作成: ${THEME_PATH}"
+          ssh -p "$SSH_PORT" -o StrictHostKeyChecking=yes -o BatchMode=yes "${SSH_USER}@${SSH_HOST}" "mkdir -p '${THEME_PATH}'"
+          echo "✅ ディレクトリ作成: wp-content/themes/${THEME_NAME}"
 
       # ─────────────────────────────────────────
-      # 15. rsync でテーマを同期
-      #     wordpress/themes/{THEME_NAME}/ → WPサーバーのテーマフォルダ
+      # 15. acf-json の退避と差分検知
+      #
+      #     ACF は wp-admin で保存すると DB とテーマ内 acf-json/ の両方へ書き出す
+      #     （functions-lib/func-acf.php で save_json / load_json をテーマ配下に設定し、
+      #       array_unshift で最優先の読み込み元にしている）。
+      #     次の rsync は --delete でリポジトリの内容に揃えるため、
+      #     サーバー側でだけ行われた編集は上書き・削除される。
+      #
+      #     (a) 消える前にドキュメントルート外へ退避する（rsync が触れない場所）
+      #     (b) 何が削除・上書きされるかを事前に出して気づけるようにする
+      # ─────────────────────────────────────────
+      - name: 🗂️ Back up and diff acf-json
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          THEME_NAME: ${{ steps.theme.outputs.name }}
+        run: |
+          ACF_REMOTE="${REMOTE_PATH}/wp-content/themes/${THEME_NAME}/acf-json"
+
+          # (a) 退避
+          #     退避先はリモートのホーム直下にする。
+          #     dirname(REMOTE_PATH) は WordPress の設置場所によっては
+          #     public_html 配下になり Web から到達できてしまうため使わない
+          #     （.htpasswd は Apache 既定の `^\.ht` 拒否で守られるが、
+          #       それ以外の名前のディレクトリは守られない）
+          ssh -p "$SSH_PORT" -o StrictHostKeyChecking=yes -o BatchMode=yes "${SSH_USER}@${SSH_HOST}" \
+            "bash -s -- '${ACF_REMOTE}' '${THEME_NAME}' '$(dirname "${REMOTE_PATH}")/.acf-json-backups'" << 'SSHEOF'
+          set -euo pipefail
+
+          ACF_DIR="$1"
+          THEME_NAME="$2"
+          LEGACY_ROOT="$3"
+          BACKUP_ROOT="${HOME}/.acf-json-backups/${THEME_NAME}"
+
+          # 以前のバージョンが Web 公開ディレクトリ配下に作ってしまった退避先を
+          # ホーム配下へ移す（消さずに移動する）
+          if [ -d "$LEGACY_ROOT" ]; then
+            mkdir -p "$BACKUP_ROOT"
+            find "$LEGACY_ROOT" -mindepth 1 -maxdepth 1 -exec mv -f {} "$BACKUP_ROOT"/ \; || true
+            rmdir "$LEGACY_ROOT" 2>/dev/null || rm -rf "$LEGACY_ROOT"
+            echo "  ⚠️  公開ディレクトリ配下にあった退避先をホーム配下へ移しました"
+          fi
+
+          if [ ! -d "$ACF_DIR" ]; then
+            echo "  サーバーに acf-json/ がまだありません（初回デプロイ）。退避不要"
+            exit 0
+          fi
+
+          COUNT=$(find "$ACF_DIR" -maxdepth 1 -name '*.json' -type f | wc -l | tr -d ' ')
+          if [ "$COUNT" -eq 0 ]; then
+            echo "  acf-json/ に JSON がありません。退避不要"
+            exit 0
+          fi
+
+          DEST="${BACKUP_ROOT}/$(date +%Y%m%d-%H%M%S)"
+          mkdir -p "$DEST"
+          cp "$ACF_DIR"/*.json "$DEST"/
+          echo "  ✅ ${COUNT} 件を退避: ${DEST}"
+
+          # 直近10世代だけ残す
+          ls -1dt "${BACKUP_ROOT}"/*/ 2>/dev/null | tail -n +11 | xargs -r rm -rf || true
+          SSHEOF
+
+          # (b) 差分検知
+          #     この後の本番 rsync で acf-json に何が起きるかを dry-run で先に確認する
+          ssh -p "$SSH_PORT" -o StrictHostKeyChecking=yes -o BatchMode=yes "${SSH_USER}@${SSH_HOST}" "mkdir -p '${ACF_REMOTE}'"
+
+          ITEMS=$(rsync -n -a --delete --itemize-changes \
+            -e "ssh -p ${SSH_PORT} -o StrictHostKeyChecking=yes -o BatchMode=yes" \
+            "wordpress/themes/${THEME_NAME}/acf-json/" \
+            "${SSH_USER}@${SSH_HOST}:${ACF_REMOTE}/")
+
+          # リポジトリに無いファイル＝サーバー側で作られたもの。これは強いシグナル
+          REMOVED=$(printf '%s\n' "$ITEMS" | grep '^\*deleting' | sed 's/^\*deleting *//' || true)
+          # 内容が変わるファイル。リポジトリ側の正当な更新でも出るため参考情報にとどめる
+          CHANGED=$(printf '%s\n' "$ITEMS" | grep '^>f' | awk '{print $2}' || true)
+
+          if [ -n "$REMOVED" ]; then
+            echo "::warning::リポジトリに存在しない acf-json がサーバーにあります（wp-admin 側で作成された可能性）"
+            printf '%s\n' "$REMOVED" | sed 's/^/  削除される: /'
+            echo "  残したい場合は ACF管理画面でエクスポートし、ローカルの acf-json/ に取り込んでコミットしてください"
+            echo "  退避済み: サーバーの ~/.acf-json-backups/${THEME_NAME}/ の最新ディレクトリ"
+          fi
+
+          if [ -n "$CHANGED" ]; then
+            echo "ℹ️  リポジトリの内容で更新される acf-json:"
+            printf '%s\n' "$CHANGED" | sed 's/^/  /'
+            echo "  リポジトリ側で変更した覚えが無い場合、サーバー側の編集が失われます（退避先から復旧できます）"
+          fi
+
+          if [ -z "$REMOVED" ] && [ -z "$CHANGED" ]; then
+            echo "✅ acf-json はリポジトリと一致しています"
+          fi
+
+      # ─────────────────────────────────────────
+      # 16. rsync でテーマを同期
+      #     wordpress/themes/{themeSlug}/ → WPサーバーのテーマフォルダ
+      #
+      #     ※ .vite/manifest.json は除外しない。
+      #        本番のアセット読み込み（func-helpers.php の get_build_manifest）が
+      #        テーマ直下の .vite/manifest.json を参照するため、
+      #        除外すると常に fallback（glob 読み込み）に落ちる
+      #     ※ --delete により「リポジトリに無いものはサーバーから消える」。
+      #        acf-json/ も同期対象なので、wp-admin 側で作成した
+      #        ACFフィールドグループの JSON は次回デプロイで失われる。
+      #        ACF の編集はローカルで行い、acf-json/ をコミットすること
       # ─────────────────────────────────────────
       - name: 🚀 Deploy theme via rsync
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          THEME_NAME: ${{ steps.theme.outputs.name }}
         run: |
-          THEME_NAME="${{ steps.theme.outputs.name }}"
           THEME_PATH="${REMOTE_PATH}/wp-content/themes/${THEME_NAME}"
           rsync -avz --delete \
             --exclude='.git' \
@@ -230,25 +679,137 @@ jobs:
             --exclude='node_modules' \
             --exclude='.DS_Store' \
             --exclude='manifest.dev.json' \
-            --exclude='.vite' \
-            -e "ssh -p ${{ secrets.SSH_PORT }}" \
+            -e "ssh -p ${SSH_PORT} -o StrictHostKeyChecking=yes -o BatchMode=yes" \
             "wordpress/themes/${THEME_NAME}/" \
-            "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:${THEME_PATH}/"
-          echo "✅ テーマ同期完了: ${THEME_PATH}"
+            "${SSH_USER}@${SSH_HOST}:${THEME_PATH}/"
+          echo "✅ テーマ同期完了: wp-content/themes/${THEME_NAME}"
 
       # ─────────────────────────────────────────
-      # 16. WordPress キャッシュクリア (WP-CLI)
+      # 17. テーマの有効化
+      #     rsync はファイルを置くだけで WordPress の有効テーマは切り替わらない。
+      #     新しいサーバーへ初めてデプロイすると既定テーマ（Twenty Twenty-*）の
+      #     ままになるため、ここで有効化する。
+      #     WP-CLI が無い環境では管理画面での手動有効化を案内する
+      # ─────────────────────────────────────────
+      - name: 🎨 Activate theme
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          THEME_NAME: ${{ steps.theme.outputs.name }}
+        run: |
+          ssh -p "$SSH_PORT" -o StrictHostKeyChecking=yes -o BatchMode=yes "${SSH_USER}@${SSH_HOST}" \
+            "bash -s -- '${REMOTE_PATH}' '${THEME_NAME}'" << 'SSHEOF'
+          set -uo pipefail
+
+          WP_ROOT="$1"
+          THEME_NAME="$2"
+
+          if ! command -v wp >/dev/null 2>&1; then
+            echo "::warning::サーバーに WP-CLI がないためテーマを自動有効化できません"
+            echo "  管理画面から一度だけ有効化してください: 外観 → テーマ → ${THEME_NAME} → 有効化"
+            echo "  一度有効化すれば、以後のデプロイでは切り替わりません"
+            exit 0
+          fi
+
+          cd "$WP_ROOT" || { echo "::warning::WordPress ルートへ移動できませんでした"; exit 0; }
+
+          CURRENT=$(wp option get stylesheet 2>/dev/null || echo "")
+
+          if [ "$CURRENT" = "$THEME_NAME" ]; then
+            echo "  ✅ 既に有効: ${THEME_NAME}"
+            exit 0
+          fi
+
+          if wp theme activate "$THEME_NAME" 2>&1; then
+            echo "  ✅ テーマを有効化しました: ${CURRENT:-不明} → ${THEME_NAME}"
+          else
+            echo "::warning::テーマの有効化に失敗しました。管理画面から手動で有効化してください"
+          fi
+          SSHEOF
+
+      # ─────────────────────────────────────────
+      # 18. WordPress キャッシュクリア (WP-CLI)
+      #     Xserver に wp コマンドが無い場合もあるため失敗は無視する
       # ─────────────────────────────────────────
       - name: 🔄 Clear WordPress cache
         continue-on-error: true
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+          SSH_USER: ${{ secrets.SSH_USER }}
         run: |
-          ssh -p ${{ secrets.SSH_PORT }} \
-            ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
-            "cd ${REMOTE_PATH} && wp cache flush --allow-root 2>/dev/null || true"
+          ssh -p "$SSH_PORT" -o StrictHostKeyChecking=yes -o BatchMode=yes "${SSH_USER}@${SSH_HOST}" \
+            "cd '${REMOTE_PATH}' && wp cache flush 2>/dev/null"
           echo "✅ キャッシュクリア試行"
 
       # ─────────────────────────────────────────
-      # 17. デプロイサマリー
+      # 19. 疎通確認（SITE_URL を設定している場合のみ）
+      #     (1) .htaccess の記述ミスで 5xx になっていないか
+      #     (2) SSL強制リダイレクトが実際に効いているか
+      #     Basic Auth 有効時は 401 が返るのが正常
+      # ─────────────────────────────────────────
+      - name: 🩺 Smoke test
+        env:
+          SITE_URL: ${{ secrets.SITE_URL }}
+        run: |
+          if [[ -z "$SITE_URL" ]]; then
+            echo "⏭  SITE_URL 未設定・スキップ（設定すると .htaccess 破損と SSL強制リダイレクトを検証できます）"
+            exit 0
+          fi
+
+          # 1. サイトが生きているか（.htaccess の記述ミスで 5xx になっていないか）
+          #    curl は接続失敗時も -w で 000 を出力した上で非ゼロ終了するため、
+          #    `|| echo 000` にすると 000 が二重に出て判定が壊れる。
+          #    終了コードだけ無視して出力をそのまま使う
+          STATUS=$(curl -s -o /dev/null -w '%{http_code}' -L --max-time 20 "$SITE_URL" || true)
+          STATUS=${STATUS:-000}
+          echo "HTTP ステータス: ${STATUS}"
+
+          case "$STATUS" in
+            5*)
+              echo "❌ サーバーエラーです。.htaccess の記述を確認してください"
+              echo "   サーバー上に .htaccess.bak.* を残しているので必要なら戻せます"
+              exit 1
+              ;;
+            000)
+              echo "::warning::接続できませんでした（ネットワーク or DNS）。手動で確認してください"
+              exit 0
+              ;;
+            *)
+              echo "✅ 疎通確認 OK（Basic認証中の 401 も Apache が生きている証拠なので OK 扱い）"
+              ;;
+          esac
+
+          # 2. SSL強制リダイレクトが効いているか
+          #    -L を付けずに http:// を叩き、https へ 301/302 するかを見る。
+          #    リライトルールを WordPress ブロックより後ろに書くと通常のページ表示で
+          #    評価されないため、配置が正しいことをここで担保する
+          HTTP_URL="http://${SITE_URL#*://}"
+          echo "::add-mask::${HTTP_URL}"
+
+          PROBE=$(curl -s -o /dev/null -w '%{http_code} %{redirect_url}' --max-time 20 "$HTTP_URL" || true)
+          read -r REDIRECT LOCATION <<< "${PROBE:-000 }"
+
+          case "$REDIRECT" in
+            30[12])
+              if [[ "$LOCATION" == https://* ]]; then
+                echo "✅ SSL強制リダイレクト OK (http → ${REDIRECT} → https)"
+              else
+                echo "::warning::http:// は ${REDIRECT} を返しましたが、転送先が https ではありません: ${LOCATION}"
+              fi
+              ;;
+            000)
+              echo "::warning::http:// へ接続できませんでした。SSL強制リダイレクトは未確認です"
+              ;;
+            *)
+              echo "::warning::http:// が ${REDIRECT} を返しました。SSL強制リダイレクトが効いていない可能性があります"
+              echo "  .htaccess の '# === SSL強制リダイレクト ===' が '# BEGIN WordPress' より前にあるか確認してください"
+              ;;
+          esac
+
+      # ─────────────────────────────────────────
+      # 20. デプロイサマリー
       # ─────────────────────────────────────────
       - name: 📊 Deploy Summary
         if: always()
