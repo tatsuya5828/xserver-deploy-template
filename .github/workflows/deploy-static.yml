@@ -405,15 +405,49 @@ jobs:
       # 作ってしまう事故を防ぐ。
       - name: 🛡️ Ensure remote directory
         run: |
-          if ! ssh -p "$SSH_PORT" -o StrictHostKeyChecking=yes -o BatchMode=yes \
-                 "${SSH_USER}@${SSH_HOST}" "test -d '${PRIVATE_DIR}'"; then
-            echo "::error::親ディレクトリがサーバ上に存在しません: ${PRIVATE_DIR}"
-            echo "::error::REMOTE_BASE_PATH の打ち間違いが疑われるため中止します。"
+          # ssh の終了コードだけでは「ディレクトリが無い」と
+          # 「接続できなかった」を区別できない（前者 1、後者 255）。
+          # Xserver は接続が間欠的に失敗するため、これを混同すると
+          # 正しい REMOTE_BASE_PATH を打ち間違い扱いにしてしまう。
+          # そこでリモート側に文字列を出力させ、その内容で判定する。
+          probe_dir() {
+            ssh -p "$SSH_PORT" -o StrictHostKeyChecking=yes -o BatchMode=yes \
+              -o ConnectTimeout=15 \
+              "${SSH_USER}@${SSH_HOST}" \
+              "test -d '$1' && echo __YES__ || echo __NO__" 2>/tmp/ssh.err
+          }
+
+          # 接続できるまで数回試す。応答が __YES__/__NO__ のどちらでもなければ
+          # 接続不良とみなしてリトライする。
+          parent_state=""
+          for attempt in 1 2 3; do
+            out="$(probe_dir "$PRIVATE_DIR")" || out=""
+            case "$out" in
+              *__YES__*) parent_state="yes"; break ;;
+              *__NO__*)  parent_state="no";  break ;;
+            esac
+            echo "SSH 接続に失敗しました（${attempt}/3）: $(cat /tmp/ssh.err 2>/dev/null | tail -1)"
+            [[ $attempt -lt 3 ]] && sleep 10
+          done
+
+          if [[ -z "$parent_state" ]]; then
+            echo "::error::サーバへ接続できませんでした（3回試行）。"
+            echo "::error::時間をおいて再実行してください（Actions → Re-run all jobs）。"
+            echo "::error::REMOTE_BASE_PATH の誤りではなく、接続の問題です。"
             exit 1
           fi
 
-          if ssh -p "$SSH_PORT" -o StrictHostKeyChecking=yes -o BatchMode=yes \
-               "${SSH_USER}@${SSH_HOST}" "test -d '${REMOTE_PATH}'"; then
+          if [[ "$parent_state" == "no" ]]; then
+            echo "::error::親ディレクトリがサーバ上に存在しません: ${PRIVATE_DIR}"
+            echo "::error::REMOTE_BASE_PATH の打ち間違いが疑われるため中止します。"
+            echo "::error::サーバ上の公開ディレクトリ一覧:"
+            ssh -p "$SSH_PORT" -o StrictHostKeyChecking=yes -o BatchMode=yes \
+              "${SSH_USER}@${SSH_HOST}" 'ls -d $HOME/*/public_html 2>/dev/null' \
+              | sed 's/^/::error::  /' || true
+            exit 1
+          fi
+
+          if [[ "$(probe_dir "$REMOTE_PATH")" == *__YES__* ]]; then
             echo "✅ デプロイ先ディレクトリを確認しました: ${REMOTE_PATH}"
           else
             ssh -p "$SSH_PORT" -o StrictHostKeyChecking=yes -o BatchMode=yes \

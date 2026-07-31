@@ -36,8 +36,21 @@ CONF
   echo "  サーバー: ${SSH_HOST}"
   echo "  種別: ${SITE_TYPE}"
   echo ""
-  # 引数モードではBasic Authをスキップ
-  USE_BASIC_AUTH="n"
+
+  # アプリから渡された値で対話を省略する。
+  # 未設定なら後段の対話にフォールバックするため、
+  # ターミナルから 6 引数で呼んだ場合の挙動は変わらない。
+  #   AUTODEPLOY_SSH_KEY_PATH : 使用する秘密鍵のパス
+  #   AUTODEPLOY_TEMPLATE     : テンプレートリポジトリ（"-" でテンプレートなし）
+  #   AUTODEPLOY_BASIC_USER   : Basic 認証ユーザー名（空なら無効）
+  #   AUTODEPLOY_BASIC_PASS   : Basic 認証パスワード
+  if [[ -n "${AUTODEPLOY_BASIC_USER:-}" ]]; then
+    USE_BASIC_AUTH="y"
+    BASIC_USER="${AUTODEPLOY_BASIC_USER}"
+    BASIC_PASS="${AUTODEPLOY_BASIC_PASS:-}"
+  else
+    USE_BASIC_AUTH="n"
+  fi
 else
 
 # ──────────────────────────────
@@ -173,7 +186,15 @@ fi
 # 鍵が1つだけの場合はそのまま使用
 KEY_COUNT=$(echo "$KEY_LIST" | wc -l | tr -d ' ')
 
-if [[ "$KEY_COUNT" -eq 1 ]]; then
+if [[ -n "${AUTODEPLOY_SSH_KEY_PATH:-}" ]]; then
+  # アプリから鍵を指定された場合は選択させない
+  KEY_PATH="${AUTODEPLOY_SSH_KEY_PATH}"
+  if [[ ! -f "$KEY_PATH" ]]; then
+    echo "❌ 指定された SSH鍵が見つかりません: ${KEY_PATH}"
+    exit 1
+  fi
+  echo "  ✅ SSH鍵を使用: $(basename ${KEY_PATH})"
+elif [[ "$KEY_COUNT" -eq 1 ]]; then
   KEY_PATH="$KEY_LIST"
   echo "  ✅ SSH鍵を使用: $(basename ${KEY_PATH})"
 else
@@ -213,7 +234,17 @@ TEMPLATE_LIST=$(gh repo list "${GH_USER}" \
 TEMPLATE_REPO=""
 FROM_TEMPLATE=false
 
-if [[ -z "$TEMPLATE_LIST" ]]; then
+if [[ -n "${AUTODEPLOY_TEMPLATE:-}" ]]; then
+  # アプリから指定された場合は選択させない（"-" はテンプレートなし）
+  if [[ "${AUTODEPLOY_TEMPLATE}" == "-" ]]; then
+    echo "  📦 テンプレートなしで作成します"
+  else
+    TEMPLATE_REPO="${AUTODEPLOY_TEMPLATE}"
+    FROM_TEMPLATE=true
+    echo "  ✅ テンプレート選択: ${TEMPLATE_REPO}"
+  fi
+
+elif [[ -z "$TEMPLATE_LIST" ]]; then
   # テンプレートが1つもない場合
   echo "  ⚠️  テンプレートリポジトリが見つかりません"
   echo "  💡 bash scripts/setup-template.sh で登録できます"
@@ -298,15 +329,56 @@ echo "  ✅ SSH_KEY"
 gh secret set REMOTE_BASE_PATH --repo "${FULL_REPO}" --body "${REMOTE_PATH}"
 echo "  ✅ REMOTE_BASE_PATH"
 
+# ── SSH_KNOWN_HOSTS ─────────────────────────────────────
+# 未設定でもワークフローは ssh-keyscan にフォールバックして動くが、
+#   ・毎回その場の鍵を無条件に信頼するため中間者攻撃を検知できない
+#   ・ssh-keyscan は間欠的に失敗し、その都度デプロイが落ちる
+# という問題がある。ここで登録しておけば両方とも解消する。
+#
+# 取得はランナーではなくこのマシンから行う。
+# GitHub 側と手元の両方が同時に攻撃されている可能性は低いため、
+# ランナー上の ssh-keyscan より信頼できる。
+KNOWN_HOSTS=""
+for attempt in 1 2 3; do
+  KNOWN_HOSTS=$(ssh-keyscan -p "${SSH_PORT}" "${SSH_HOST}" 2>/dev/null) && [[ -n "$KNOWN_HOSTS" ]] && break
+  KNOWN_HOSTS=""
+  sleep 3
+done
+
+if [[ -n "$KNOWN_HOSTS" ]]; then
+  # 手元に既存の記録があれば照合する（取得した鍵が本物かの裏取り）
+  if ssh-keygen -F "[${SSH_HOST}]:${SSH_PORT}" >/dev/null 2>&1; then
+    EXISTING_FP=$(ssh-keygen -F "[${SSH_HOST}]:${SSH_PORT}" 2>/dev/null \
+      | grep -v '^#' | ssh-keygen -lf - 2>/dev/null | awk '{print $2}' | sort)
+    FETCHED_FP=$(printf '%s\n' "$KNOWN_HOSTS" | ssh-keygen -lf - 2>/dev/null | awk '{print $2}' | sort)
+
+    if [[ "$EXISTING_FP" != "$FETCHED_FP" ]]; then
+      echo "::warning:: 取得したホスト鍵が既存の known_hosts と一致しません"
+      echo "   サーバー移転の可能性がありますが、念のため確認してください"
+    fi
+  fi
+
+  printf '%s\n' "$KNOWN_HOSTS" | gh secret set SSH_KNOWN_HOSTS --repo "${FULL_REPO}"
+  echo "  ✅ SSH_KNOWN_HOSTS（ホスト鍵を検証します）"
+else
+  echo "  ⚠️  SSH_KNOWN_HOSTS: ホスト鍵を取得できませんでした"
+  echo "     デプロイは ssh-keyscan にフォールバックして動作します"
+  echo "     後から登録する場合:"
+  echo "       ssh-keyscan -p ${SSH_PORT} <ホスト名> | gh secret set SSH_KNOWN_HOSTS --repo ${FULL_REPO}"
+fi
+
 # ── Basic Auth（任意）────────────────────────────────────
 echo ""
 if [[ -z "${USE_BASIC_AUTH:-}" ]]; then
   read -r -p "🔐 ベーシック認証を設定しますか？ [y/N]: " USE_BASIC_AUTH
 fi
 if [[ "$USE_BASIC_AUTH" =~ ^[Yy]$ ]]; then
-  read -r -p "  ユーザー名: " BASIC_USER
-  read -r -s -p "  パスワード: " BASIC_PASS
-  echo ""
+  # アプリから渡されている場合は聞かない
+  if [[ -z "${BASIC_USER:-}" ]]; then
+    read -r -p "  ユーザー名: " BASIC_USER
+    read -r -s -p "  パスワード: " BASIC_PASS
+    echo ""
+  fi
   gh secret set BASIC_AUTH_USER --repo "${FULL_REPO}" --body "${BASIC_USER}"
   echo "  ✅ BASIC_AUTH_USER"
   gh secret set BASIC_AUTH_PASS --repo "${FULL_REPO}" --body "${BASIC_PASS}"
